@@ -31,7 +31,7 @@ It works with **any app that reports to the Windows media session API**: Spotify
 
 - ESP32 development board
 - 240×240 TFT display (TFT_eSPI-compatible), backlight on GPIO 21
-- USB cable for power/programming
+  ● Designed for a 240×240 TFT display supported by TFT_eSPI. Other TFT_eSPI displays may work with configuration and layout adjustments.
 
 ## Firmware setup (ESP32)
 
