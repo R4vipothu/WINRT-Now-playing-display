@@ -11,7 +11,7 @@ It works with **any app that reports to the Windows media session API**: Spotify
 ```
  Windows PC                                        ESP32
 ┌───────────────────────────┐   WebSocket    ┌────────────────────┐
-│ now_playing_server.py     │ ─────────────▶ │ NowPlayingDisplay  │
+│ now_playing_server.py     │ ────────────➜ │ NowPlayingDisplay  │
 │                           │   port 8765    │ .ino (LVGL UI)     │
 │ • WinRT media session API │                │                    │
 │ • Sends track metadata    │                │ • Renders art,     │
