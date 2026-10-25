@@ -72,10 +72,10 @@ now-playing-display/
 - Switching between square (1:1) and non-square album art can misplace the cover offset on the display.
 - The WebSocket server has no authentication by design — it is meant to run on a trusted home LAN only. Don't expose port 8765 to the internet.
 
-## Possible future work
+## Implemented but not used
 
-- On-device playback/volume control — the server already includes pycaw-based volume helpers (`setVolume`, `mute`, `getVolume`) that aren't wired to device input yet.
-- Pause/play state indicator polish on the display.
+- Inputs to the script are included but not coded in the file. Wiring a button and adding a receive case in the Python file fixes this.
+- Pause/play states are sent back and forth but not displayed
 
 ## License
 
