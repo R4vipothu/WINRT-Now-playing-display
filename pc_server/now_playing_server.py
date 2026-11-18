@@ -22,8 +22,9 @@ audio_pool = ThreadPoolExecutor(max_workers=1)  # one thread, so COM state stays
 
 UPDATE_MANAGER_TIME = 5 #constant used to check if the media has switched platforms
 
-startTime = 0
-avgTimes = []
+# network tester bookkeeping (commented out with the SpeedTest handler)
+# startTime = 0
+# avgTimes = []
 
 backgroundColor = 0xFFFFFF
 
@@ -122,6 +123,50 @@ async def setVolume(level):  # use me
 async def getVolume():
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(audio_pool, _get_volume)
+
+# Playback control: WinRT SMTC sessions are read-only (you can watch them,
+# not command them), so playback gestures are sent as virtual media keys via
+# SendInput. Windows routes them to whatever app owns the active media
+# session (Spotify, a browser, VLC, ...). Uses the same single-worker pool
+# as the volume functions so commands stay serialized.
+VK_MEDIA_PLAY_PAUSE = 0xB3
+VK_MEDIA_NEXT_TRACK = 0xB0
+VK_MEDIA_PREV_TRACK = 0xB1
+
+def _send_media_key(vk):
+    import ctypes
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", ctypes.c_ushort),
+                    ("wScan", ctypes.c_ushort),
+                    ("dwFlags", ctypes.c_ulong),
+                    ("time", ctypes.c_ulong),
+                    ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+    class INPUTunion(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT), ("padding", ctypes.c_ubyte * 32)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_ulong), ("union", INPUTunion)]
+
+    extra = ctypes.c_ulong(0)
+    inputs = (INPUT * 2)()
+    for i, flags in enumerate((0, 2)):  # key down, then KEYEVENTF_KEYUP
+        inputs[i].type = 1  # INPUT_KEYBOARD
+        inputs[i].union.ki = KEYBDINPUT(vk, 0, flags, 0, ctypes.pointer(extra))
+    ctypes.windll.user32.SendInput(2, inputs, ctypes.sizeof(INPUT))
+
+async def playPause():
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(audio_pool, _send_media_key, VK_MEDIA_PLAY_PAUSE)
+
+async def nextTrack():
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(audio_pool, _send_media_key, VK_MEDIA_NEXT_TRACK)
+
+async def previousTrack():
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(audio_pool, _send_media_key, VK_MEDIA_PREV_TRACK)
 
 def fixName(name):
     newName = ""
@@ -275,13 +320,28 @@ async def handle_client(websocket): #set up websocket
                 try:
                     data = json.loads(message)
                     if "action" in data:
-                        if data["action"] == "SpeedTest":
-                            global avgTimes
-                            diff = time.perf_counter() - startTime
-                            print("Time between there and back:", diff)
-                            if diff < 1000: #spikes to some unreasonable number at the beginning when initializing, skips it
-                                avgTimes += [diff]
-                                print("avg: ", sum(avgTimes) / len(avgTimes))
+                        if data["action"] == "Volume":
+                            # knob reports 0-100, pycaw wants 0.0-1.0
+                            level = max(0.0, min(1.0, float(data.get("value", 0)) / 100.0))
+                            await setVolume(level)
+                            print("Volume ->", round(level * 100))
+                        elif data["action"] == "PlayPause":
+                            await playPause()
+                            print("PlayPause")
+                        elif data["action"] == "Next":
+                            await nextTrack()
+                            print("Next")
+                        elif data["action"] == "Previous":
+                            await previousTrack()
+                            print("Previous")
+                        # --- network tester commented out ---
+                        # if data["action"] == "SpeedTest":
+                        #     global avgTimes
+                        #     diff = time.perf_counter() - startTime
+                        #     print("Time between there and back:", diff)
+                        #     if diff < 1000: #spikes to some unreasonable number at the beginning when initializing, skips it
+                        #         avgTimes += [diff]
+                        #         print("avg: ", sum(avgTimes) / len(avgTimes))
                     if "BGColor" in data:
                         global backgroundColor
 
@@ -371,8 +431,8 @@ async def update_media(mediaController, session, websocket):  #main media grabbe
                 posInSeconds = int(position.total_seconds())
                 endTimeInSeconds = int(endTime.total_seconds())
 
-                global startTime
-                startTime = time.perf_counter()
+                # global startTime      # network tester bookkeeping, commented out
+                # startTime = time.perf_counter()
                 response = {
                     "type": "media_update",
                     "volume": currentVol,
