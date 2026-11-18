@@ -63,7 +63,6 @@ now-playing-display/
 └── firmware/
     └── NowPlayingDisplay/
         ├── NowPlayingDisplay.ino
-        ├── placeHolderImage.c  # LVGL image asset shown when nothing is playing
         └── config.example.h    # copy to config.h with your values
 ```
 

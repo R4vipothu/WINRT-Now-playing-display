@@ -1,0 +1,12 @@
+# IDE / environment
+.idea/
+.venv/
+__pycache__/
+
+# local-only folders (dev copies with hardcoded credentials - do not publish)
+spotifyProject/
+playbackpy/
+archive/
+
+# firmware credentials - copy config.example.h and fill in your own values
+firmware/NowPlayingDisplay/config.h
