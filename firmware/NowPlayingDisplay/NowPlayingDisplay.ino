@@ -48,6 +48,17 @@
 #define VINYL_SIZE 200 // diameter of the album-art disc
 #define RING_SIZE 216  // progress ring diameter, slightly larger than the art
 
+// ---- rotary knob (pot + push switch) ----
+#define POT_PIN 34            // potentiometer wiper; ADC1 only - ADC2 can't run while WiFi is on
+#define BTN_PIN 27            // push switch wired to GND, read with INPUT_PULLUP
+#define POT_SAMPLES 8         // moving-average window for the ADC
+#define POT_DEADBAND_PCT 2    // ignore volume changes smaller than this (jitter)
+#define VOLUME_SEND_MS 100    // throttle for volume messages while turning
+#define VOLUME_SETTLE_MS 150  // always send the final value this long after rotation stops
+#define BTN_DEBOUNCE_MS 40
+#define GESTURE_WINDOW_MS 350 // max gap between two taps that counts as a double press
+#define LONGPRESS_MS 600      // hold longer than this = previous track
+
 #define DRAW_BUF_SIZE (TFT_HOR_RES * TFT_VER_RES / 24 * (LV_COLOR_DEPTH / 8))
 uint32_t draw_buf[DRAW_BUF_SIZE / 4];
 
@@ -132,6 +143,10 @@ void setup() {
 
   pinMode(21, OUTPUT);
   digitalWrite(21, HIGH);
+
+  // rotary knob inputs
+  pinMode(POT_PIN, INPUT);        // GPIO34 is input-only; used purely as ADC1
+  pinMode(BTN_PIN, INPUT_PULLUP); // switch between BTN_PIN and GND
 
   //display configuration
   Serial.println("Starting intialization");
@@ -240,8 +255,147 @@ void setup() {
   angleOfAlbum = 0;
 }
 
+// ============================================================
+// Rotary knob: pot = volume, push switch = playback gestures.
+// Everything is millis()-based; never blocks the LVGL tick or
+// the WebSocket pump in loop().
+// ============================================================
+static uint16_t potWindow[POT_SAMPLES]; // moving-average window
+static uint8_t potIdx = 0;
+static uint32_t potSum = 0;
+
+static int lastVolumeSeen = -1;         // latest deadbanded reading
+static int lastVolumeSent = -1;         // last value actually sent to the PC
+static unsigned long lastVolumeSend = 0;
+static unsigned long lastPotMove = 0;
+static bool volumeFinalPending = false; // a throttled change still needs its final send
+
+static bool btnLastRaw = false;
+static bool btnPressed = false;         // debounced state, true = pressed
+static unsigned long btnChangeAt = 0;
+static unsigned long pressStartAt = 0;
+static bool longPressFired = false;
+static bool waitingSecondTap = false;
+static unsigned long windowStartAt = 0;
+
+static lv_obj_t *volumeLabel = nullptr; // stretch goal: tiny on-screen volume readout
+static unsigned long volumeLabelHideAt = 0;
+
+static void sendVolume(int pct) { // {"action":"Volume","value":N} on the action channel
+  JsonDocument doc;
+  doc["action"] = "Volume";
+  doc["value"] = pct;
+
+  String msg;
+  serializeJson(doc, msg);
+  webSocket.sendTXT(msg);
+  Serial.println(msg);
+}
+
+static void showVolumeLabel(int pct) {
+  if (volumeLabel == nullptr) { // created lazily, hidden by default, so the
+    volumeLabel = lv_label_create(lv_screen_active()); // existing layout is untouched
+    lv_obj_set_style_text_font(volumeLabel, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(volumeLabel, lv_color_make(255, 255, 255), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(volumeLabel, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(volumeLabel, LV_OPA_70, LV_PART_MAIN);
+    lv_obj_set_style_radius(volumeLabel, 10, LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(volumeLabel, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(volumeLabel, 4, LV_PART_MAIN);
+    lv_obj_align(volumeLabel, LV_ALIGN_CENTER, 0, -60);
+    lv_obj_add_flag(volumeLabel, LV_OBJ_FLAG_HIDDEN);
+  }
+  char buf[12];
+  snprintf(buf, sizeof(buf), "Vol %d%%", pct);
+  lv_label_set_text(volumeLabel, buf);
+  lv_obj_remove_flag(volumeLabel, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(volumeLabel);
+  volumeLabelHideAt = millis() + 1000; // hide ~1 s after the last change
+}
+
+static void serviceKnob() {
+  unsigned long now = millis();
+
+  // ---- volume: read -> smooth -> deadband -> throttle ----
+  potSum -= potWindow[potIdx];
+  potWindow[potIdx] = analogRead(POT_PIN);
+  potSum += potWindow[potIdx];
+  potIdx = (potIdx + 1) % POT_SAMPLES;
+  int pct = constrain(map((int)(potSum / POT_SAMPLES), 0, 4095, 0, 100), 0, 100);
+
+  if (lastVolumeSeen < 0) { // first reading after boot: adopt silently, don't spam the PC
+    lastVolumeSeen = pct;
+    lastVolumeSent = pct;
+  }
+  else if (abs(pct - lastVolumeSeen) >= POT_DEADBAND_PCT) { // deadband
+    lastVolumeSeen = pct;
+    lastPotMove = now;
+    showVolumeLabel(lastVolumeSeen);
+    if (now - lastVolumeSend >= VOLUME_SEND_MS) { // throttle while turning
+      sendVolume(lastVolumeSeen);
+      lastVolumeSent = lastVolumeSeen;
+      lastVolumeSend = now;
+      volumeFinalPending = false;
+    }
+    else {
+      volumeFinalPending = true;
+    }
+  }
+  if (volumeFinalPending && now - lastPotMove >= VOLUME_SETTLE_MS) { // final value after settling
+    if (lastVolumeSeen != lastVolumeSent) {
+      sendVolume(lastVolumeSeen);
+    }
+    lastVolumeSent = lastVolumeSeen;
+    lastVolumeSend = now;
+    volumeFinalPending = false;
+  }
+
+  // ---- button: debounce + tap / double tap / hold ----
+  bool raw = digitalRead(BTN_PIN) == LOW; // INPUT_PULLUP: pressed = LOW
+  if (raw != btnLastRaw) {
+    btnLastRaw = raw;
+    btnChangeAt = now;
+  }
+  if (raw != btnPressed && now - btnChangeAt >= BTN_DEBOUNCE_MS) {
+    btnPressed = raw;
+    if (btnPressed) { // press starts: long-press window opens
+      pressStartAt = now;
+      longPressFired = false;
+    }
+    else if (!longPressFired) { // released before the long-press threshold
+      if (waitingSecondTap && now - windowStartAt <= GESTURE_WINDOW_MS) {
+        sendAction("Next"); // double press: two taps inside the window
+        waitingSecondTap = false;
+      }
+      else {
+        waitingSecondTap = true; // could still become a double press - hold on
+        windowStartAt = now;
+      }
+    }
+  }
+  if (btnPressed && !longPressFired && now - pressStartAt >= LONGPRESS_MS) {
+    longPressFired = true; // fires once at the threshold, not on release
+    waitingSecondTap = false; // a hold also cancels any pending single tap
+    sendAction("Previous");
+  }
+  if (waitingSecondTap && now - windowStartAt > GESTURE_WINDOW_MS) {
+    if (!btnPressed) { // nothing came: it was a plain short press
+      sendAction("PlayPause");
+    }
+    waitingSecondTap = false; // if a press is still held, the long-press path owns it
+  }
+
+  // ---- volume label auto-hide ----
+  if (volumeLabel != nullptr &&
+      !lv_obj_has_flag(volumeLabel, LV_OBJ_FLAG_HIDDEN) &&
+      (long)(now - volumeLabelHideAt) >= 0) {
+    lv_obj_add_flag(volumeLabel, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
 void loop() {
   webSocket.loop();
+  serviceKnob();
   if (title == "Unknown" && artist == "No Artist Available" && title != lastTitle && artist != lastArtist){ 
     setUnknownLabels();
 
