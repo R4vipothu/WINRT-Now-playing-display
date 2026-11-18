@@ -2,6 +2,7 @@
 import asyncio
 import struct
 import time
+import ctypes
 
 import websockets
 
@@ -134,8 +135,6 @@ VK_MEDIA_NEXT_TRACK = 0xB0
 VK_MEDIA_PREV_TRACK = 0xB1
 
 def _send_media_key(vk):
-    import ctypes
-
     class KEYBDINPUT(ctypes.Structure):
         _fields_ = [("wVk", ctypes.c_ushort),
                     ("wScan", ctypes.c_ushort),
@@ -320,28 +319,34 @@ async def handle_client(websocket): #set up websocket
                 try:
                     data = json.loads(message)
                     if "action" in data:
-                        if data["action"] == "Volume":
-                            # knob reports 0-100, pycaw wants 0.0-1.0
-                            level = max(0.0, min(1.0, float(data.get("value", 0)) / 100.0))
-                            await setVolume(level)
-                            print("Volume ->", round(level * 100))
-                        elif data["action"] == "PlayPause":
-                            await playPause()
-                            print("PlayPause")
-                        elif data["action"] == "Next":
-                            await nextTrack()
-                            print("Next")
-                        elif data["action"] == "Previous":
-                            await previousTrack()
-                            print("Previous")
-                        # --- network tester commented out ---
-                        # if data["action"] == "SpeedTest":
-                        #     global avgTimes
-                        #     diff = time.perf_counter() - startTime
-                        #     print("Time between there and back:", diff)
-                        #     if diff < 1000: #spikes to some unreasonable number at the beginning when initializing, skips it
-                        #         avgTimes += [diff]
-                        #         print("avg: ", sum(avgTimes) / len(avgTimes))
+                        # knob/gesture commands; guarded so a malformed value
+                        # can't kill the client task (only JSONDecodeError is
+                        # caught by the outer try)
+                        try:
+                            if data["action"] == "Volume":
+                                # knob reports 0-100, pycaw wants 0.0-1.0
+                                level = max(0.0, min(1.0, float(data.get("value", 0)) / 100.0))
+                                await setVolume(level)
+                                print("Volume ->", round(level * 100))
+                            elif data["action"] == "PlayPause":
+                                await playPause()
+                                print("PlayPause")
+                            elif data["action"] == "Next":
+                                await nextTrack()
+                                print("Next")
+                            elif data["action"] == "Previous":
+                                await previousTrack()
+                                print("Previous")
+                            # --- network tester commented out ---
+                            # if data["action"] == "SpeedTest":
+                            #     global avgTimes
+                            #     diff = time.perf_counter() - startTime
+                            #     print("Time between there and back:", diff)
+                            #     if diff < 1000: #spikes to some unreasonable number at the beginning when initializing, skips it
+                            #         avgTimes += [diff]
+                            #         print("avg: ", sum(avgTimes) / len(avgTimes))
+                        except (TypeError, ValueError) as err:
+                            print("Bad action payload:", err)
                     if "BGColor" in data:
                         global backgroundColor
 

@@ -43,16 +43,20 @@
 #define TFT_VER_RES 240
 #define TFT_ROTATION LV_ROTATION_0
 
-#define ACCENT 0x4F80FF
-
 #define VINYL_SIZE 200 // diameter of the album-art disc
 #define RING_SIZE 216  // progress ring diameter, slightly larger than the art
+#define VINYL_Y_OFFSET 14 // px the vinyl group is nudged up from center
+#define ROTATION_TIMER_MS 40    // spin tick interval
+#define ROTATION_STEP_DEG 20    // spin step per tick (of 3600 = one turn)
+#define STRIP_HEIGHT 58         // bottom text strip
+#define STRIP_CORE_HEIGHT 34    // denser lower band of the strip
 
 // ---- rotary knob (pot + push switch) ----
 #define POT_PIN 34            // potentiometer wiper; ADC1 only - ADC2 can't run while WiFi is on
 #define BTN_PIN 27            // push switch wired to GND, read with INPUT_PULLUP
 #define POT_SAMPLES 8         // moving-average window for the ADC
 #define POT_DEADBAND_PCT 2    // ignore volume changes smaller than this (jitter)
+#define POT_READ_MS 10        // fixed ADC sampling cadence, independent of loop speed
 #define VOLUME_SEND_MS 100    // throttle for volume messages while turning
 #define VOLUME_SETTLE_MS 150  // always send the final value this long after rotation stops
 #define BTN_DEBOUNCE_MS 40
@@ -62,9 +66,9 @@
 #define DRAW_BUF_SIZE (TFT_HOR_RES * TFT_VER_RES / 24 * (LV_COLOR_DEPTH / 8))
 uint32_t draw_buf[DRAW_BUF_SIZE / 4];
 
-#define MUSICDISPLAYTYPE 2 //1 for standard, 2 for spinning disk (theres no alpha variable so make the image smaller so the blended background doesnt clip, could prolly adjust when the text is displayed but i dont wanna :) ) 
+#define MUSICDISPLAYTYPE 2 // 2 = spinning vinyl layout (sent to the PC as "DisplayType"); 1 = legacy static layout, unused since the vinyl redesign
 
-TFT_eSPI tft = TFT_eSPI();
+#define DEBUG_LOG 0 // 1 = verbose serial logging (WS events, chunks, positions); errors always print
 
 #include "config.h"  // Wi-Fi credentials + PC address (see config.example.h)
 
@@ -73,19 +77,21 @@ const char* PASSWORD = WIFI_PASSWORD;
 
 WebSocketsClient webSocket;
 
-bool setupComplete = false;
+char title[64];      // fixed buffers: no heap churn from per-second String reassignment
+char artist[64];
+char lastTitle[64];
+char lastArtist[64];
 
-uint16_t volume;
-bool playing;
-String title;
-String artist;
+uint16_t volume;     // read from media_update, reserved for future UI use
+bool playing;        // read from media_update, reserved for future UI use
 
-uint16_t currentPosition;
-uint16_t endPosition;
-uint16_t lastPosition;
+uint32_t currentPosition;
+uint32_t endPosition;
+int lastPosition;    // last progress percentage shown on the ring
 
-String lastTitle;
-String lastArtist;
+static bool haveTrackInfo = false;     // true once a real media_update arrives
+static bool unknownStateShown = false; // blank record + placeholder text already shown
+static bool spinning = false;          // the record art is currently rotating
 
 uint16_t heightOfImage;
 uint16_t widthOfImage;
@@ -96,28 +102,21 @@ static lv_image_dsc_t lvglCoverImage;
 
 lv_obj_t *coverImage = nullptr;
 lv_obj_t *placeHolderCover = nullptr;
-lv_obj_t *progressBar = nullptr;
+lv_obj_t *progressRing = nullptr;
 lv_obj_t *nameOfSong;
 lv_obj_t *nameOfArtist;
-lv_obj_t *blackCircle;
+lv_obj_t *spindleHub;
 lv_obj_t *vinylDisc = nullptr; // circular clipping container that holds the art
 lv_obj_t *textStrip = nullptr; // semi-transparent strip behind the track info
-
-const int DISTANCE_FROM_TOP = 14; //px the vinyl group is nudged up from center
 
 size_t bytesReceived;
 size_t albumDataSize;
 
 int angleOfAlbum;
-int ROTATIONTIMER_MS = 40;
 unsigned long previousMillis = 0;
 
 //hex codes for colors
 uint32_t BLACK = 0x000000;
-uint32_t DARK_GRAY = 0x121212;
-uint32_t NAVY_BLUE = 0x101828;
-uint32_t WHITE = 0xFFFFFF;
-uint32_t PURPLE = 0x20102F;
 uint32_t RING_TRACK = 0x3A3A3A;  // dim gray ring track line
 uint32_t RING_ACCENT = 0xFF5A3C; // orange-red ring progress
 
@@ -129,6 +128,23 @@ void initCoverImage(){
   lvglCoverImage.data_size = 180* 180 * LV_COLOR_DEPTH / 8;
   lvglCoverImage.header.cf = LV_COLOR_FORMAT_NATIVE;          /* Set the color format */
   lvglCoverImage.data = nullptr;
+}
+
+static lv_obj_t *makeDisc(lv_obj_t *parent, int size, uint32_t bgColor) {
+  lv_obj_t *disc = lv_obj_create(parent);
+  lv_obj_set_size(disc, size, size);
+  lv_obj_set_style_radius(disc, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(disc, lv_color_hex(bgColor), 0);
+  lv_obj_set_style_bg_opa(disc, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(disc, 0, 0);
+  lv_obj_set_style_pad_all(disc, 0, 0);
+  lv_obj_remove_flag(disc, LV_OBJ_FLAG_SCROLLABLE);
+  return disc;
+}
+
+static void copyTrackField(char *dst, size_t cap, const char *src) { // bounded copy into a fixed buffer
+  strncpy(dst, src, cap - 1);
+  dst[cap - 1] = '\0';
 }
 
 void setup() {
@@ -170,33 +186,12 @@ void setup() {
   lv_obj_set_style_text_color(placeholder, lv_color_hex(0xD9B8FF), LV_PART_MAIN);
 
   // blank vinyl disc shown while there is no album art (no bitmap needed anymore)
-  placeHolderCover = lv_obj_create(lv_screen_active());
-  lv_obj_set_size(placeHolderCover, VINYL_SIZE, VINYL_SIZE);
-  lv_obj_align(placeHolderCover, LV_ALIGN_CENTER, 0, -DISTANCE_FROM_TOP);
-  lv_obj_set_style_radius(placeHolderCover, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(placeHolderCover, lv_color_hex(0x141414), 0);
-  lv_obj_set_style_bg_opa(placeHolderCover, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(placeHolderCover, 0, 0);
-  lv_obj_set_style_pad_all(placeHolderCover, 0, 0);
-  lv_obj_remove_flag(placeHolderCover, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_t *hole = lv_obj_create(placeHolderCover); // spindle hole of the blank record
-  lv_obj_set_size(hole, 26, 26);
+  placeHolderCover = makeDisc(lv_screen_active(), VINYL_SIZE, 0x141414);
+  lv_obj_align(placeHolderCover, LV_ALIGN_CENTER, 0, -VINYL_Y_OFFSET);
+  lv_obj_t *hole = makeDisc(placeHolderCover, 26, BLACK); // spindle hole of the blank record
   lv_obj_align(hole, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_set_style_radius(hole, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(hole, lv_color_black(), 0);
-  lv_obj_set_style_bg_opa(hole, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(hole, 0, 0);
-  lv_obj_set_style_pad_all(hole, 0, 0);
-  lv_obj_remove_flag(hole, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_t *dot = lv_obj_create(hole); // tiny center dot
-  lv_obj_set_size(dot, 5, 5);
+  lv_obj_t *dot = makeDisc(hole, 5, 0x6E6E6E);            // tiny center dot
   lv_obj_align(dot, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(dot, lv_color_hex(0x6E6E6E), 0);
-  lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(dot, 0, 0);
-  lv_obj_set_style_pad_all(dot, 0, 0);
-  lv_obj_remove_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(placeHolderCover, LV_OBJ_FLAG_HIDDEN);
 
   lv_timer_handler();
@@ -213,7 +208,7 @@ void setup() {
 
   // dark semi-transparent strip so the track info stays readable over the art
   textStrip = lv_obj_create(lv_screen_active());
-  lv_obj_set_size(textStrip, TFT_HOR_RES, 58);
+  lv_obj_set_size(textStrip, TFT_HOR_RES, STRIP_HEIGHT);
   lv_obj_align(textStrip, LV_ALIGN_BOTTOM_MID, 0, 0);
   lv_obj_set_style_bg_color(textStrip, lv_color_black(), 0);
   lv_obj_set_style_bg_opa(textStrip, LV_OPA_30, 0); // faint upper fade
@@ -222,7 +217,7 @@ void setup() {
   lv_obj_set_style_pad_all(textStrip, 0, 0);
   lv_obj_remove_flag(textStrip, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_t *stripCore = lv_obj_create(textStrip); // stronger lower band -> fake gradient
-  lv_obj_set_size(stripCore, TFT_HOR_RES, 34);
+  lv_obj_set_size(stripCore, TFT_HOR_RES, STRIP_CORE_HEIGHT);
   lv_obj_align(stripCore, LV_ALIGN_BOTTOM_MID, 0, 0);
   lv_obj_set_style_bg_color(stripCore, lv_color_black(), 0);
   lv_obj_set_style_bg_opa(stripCore, LV_OPA_50, 0);
@@ -240,10 +235,10 @@ void setup() {
   
   playing = false; // assume there's no music
   volume = 0;
-  title = "Unknown";
-  artist = "No Artist Available";
-  lastArtist = "null";
-  lastTitle = "null";
+  strcpy(title, "Unknown");
+  strcpy(artist, "No Artist Available");
+  strcpy(lastTitle, "null");
+  strcpy(lastArtist, "null");
 
   currentPosition = 0;
   endPosition = 0;
@@ -268,6 +263,7 @@ static int lastVolumeSeen = -1;         // latest deadbanded reading
 static int lastVolumeSent = -1;         // last value actually sent to the PC
 static unsigned long lastVolumeSend = 0;
 static unsigned long lastPotMove = 0;
+static unsigned long lastPotRead = 0;
 static bool volumeFinalPending = false; // a throttled change still needs its final send
 
 static bool btnLastRaw = false;
@@ -286,8 +282,8 @@ static void sendVolume(int pct) { // {"action":"Volume","value":N} on the action
   doc["action"] = "Volume";
   doc["value"] = pct;
 
-  String msg;
-  serializeJson(doc, msg);
+  char msg[32];
+  serializeJson(doc, msg, sizeof(msg));
   webSocket.sendTXT(msg);
   Serial.println(msg);
 }
@@ -316,29 +312,32 @@ static void showVolumeLabel(int pct) {
 static void serviceKnob() {
   unsigned long now = millis();
 
-  // ---- volume: read -> smooth -> deadband -> throttle ----
-  potSum -= potWindow[potIdx];
-  potWindow[potIdx] = analogRead(POT_PIN);
-  potSum += potWindow[potIdx];
-  potIdx = (potIdx + 1) % POT_SAMPLES;
-  int pct = constrain(map((int)(potSum / POT_SAMPLES), 0, 4095, 0, 100), 0, 100);
+  // ---- volume: sample on a fixed cadence -> smooth -> deadband -> throttle ----
+  if (now - lastPotRead >= POT_READ_MS) {
+    lastPotRead = now;
+    potSum -= potWindow[potIdx];
+    potWindow[potIdx] = analogRead(POT_PIN);
+    potSum += potWindow[potIdx];
+    potIdx = (potIdx + 1) % POT_SAMPLES;
+    int pct = constrain(map((int)(potSum / POT_SAMPLES), 0, 4095, 0, 100), 0, 100);
 
-  if (lastVolumeSeen < 0) { // first reading after boot: adopt silently, don't spam the PC
-    lastVolumeSeen = pct;
-    lastVolumeSent = pct;
-  }
-  else if (abs(pct - lastVolumeSeen) >= POT_DEADBAND_PCT) { // deadband
-    lastVolumeSeen = pct;
-    lastPotMove = now;
-    showVolumeLabel(lastVolumeSeen);
-    if (now - lastVolumeSend >= VOLUME_SEND_MS) { // throttle while turning
-      sendVolume(lastVolumeSeen);
-      lastVolumeSent = lastVolumeSeen;
-      lastVolumeSend = now;
-      volumeFinalPending = false;
+    if (lastVolumeSeen < 0) { // first reading after boot: adopt silently, don't spam the PC
+      lastVolumeSeen = pct;
+      lastVolumeSent = pct;
     }
-    else {
-      volumeFinalPending = true;
+    else if (abs(pct - lastVolumeSeen) >= POT_DEADBAND_PCT) { // deadband
+      lastVolumeSeen = pct;
+      lastPotMove = now;
+      showVolumeLabel(lastVolumeSeen);
+      if (now - lastVolumeSend >= VOLUME_SEND_MS) { // throttle while turning
+        sendVolume(lastVolumeSeen);
+        lastVolumeSent = lastVolumeSeen;
+        lastVolumeSend = now;
+        volumeFinalPending = false;
+      }
+      else {
+        volumeFinalPending = true;
+      }
     }
   }
   if (volumeFinalPending && now - lastPotMove >= VOLUME_SETTLE_MS) { // final value after settling
@@ -393,26 +392,38 @@ static void serviceKnob() {
   }
 }
 
+static void fitArtToDisc(){ // scale the art so its larger side fills the 200px disc
+  uint16_t largest = lvglCoverImage.header.w > lvglCoverImage.header.h ? lvglCoverImage.header.w : lvglCoverImage.header.h;
+  if (largest == 0) largest = 1;
+  lv_image_set_scale(coverImage, 256 * VINYL_SIZE / largest); // 256 = 100% in LVGL v9
+}
+
+static void applyImageGeometry(){ // re-fit the cover when the art size changes; no-op if none is up
+  if (coverImage == nullptr) return;
+  fitArtToDisc();
+  lv_image_set_pivot(coverImage, lvglCoverImage.header.w/2, lvglCoverImage.header.h/2);
+}
+
 void loop() {
   webSocket.loop();
   serviceKnob();
-  if (title == "Unknown" && artist == "No Artist Available" && title != lastTitle && artist != lastArtist){ 
-    setUnknownLabels();
+  if (!haveTrackInfo) { // no real media_update yet: blank record + placeholder text
+    if (!unknownStateShown) {
+      setUnknownLabels();
+      unknownStateShown = true;
 
-    if(coverImage != nullptr){
-      lv_obj_add_flag(coverImage, LV_OBJ_FLAG_HIDDEN);
+      if (coverImage != nullptr){
+        lv_obj_add_flag(coverImage, LV_OBJ_FLAG_HIDDEN);
+      }
+      if(vinylDisc != nullptr){
+        lv_obj_add_flag(vinylDisc, LV_OBJ_FLAG_HIDDEN);
+      }
     }
-    if(vinylDisc != nullptr){
-      lv_obj_add_flag(vinylDisc, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    lastTitle = title;
-    lastArtist = artist;
-    
   }
-  else if (lvglCoverImage.data != nullptr){
+  else if (lvglCoverImage.data != nullptr){ // track info + art available
+    unknownStateShown = false;
     if (coverImage == nullptr){ // creates the cover image for the first time
-      initLVGLLabels();
+      initVinylUI();
     }
     else{
       lv_obj_remove_flag(coverImage, LV_OBJ_FLAG_HIDDEN);
@@ -421,27 +432,40 @@ void loop() {
       }
     }
 
-    if (title != lastTitle || artist != lastArtist) {
+    if (strcmp(title, lastTitle) != 0 || strcmp(artist, lastArtist) != 0) {
       updateLabels();
     }
 
-    if (heightOfImage == widthOfImage && MUSICDISPLAYTYPE == 2 && my_tick()-previousMillis >= ROTATIONTIMER_MS){
-      lv_image_set_rotation(coverImage, angleOfAlbum);
-      lv_obj_remove_flag(blackCircle, LV_OBJ_FLAG_HIDDEN);
-      angleOfAlbum = (angleOfAlbum + 20) % 3600;
-      previousMillis = my_tick();
+    // spin the record only while the art is square (updates happen on state transitions)
+    bool wantSpin = (heightOfImage == widthOfImage && MUSICDISPLAYTYPE == 2);
+    if (wantSpin) {
+      if (!spinning) { // transition: show the spindle once, start turning
+        spinning = true;
+        lv_obj_remove_flag(spindleHub, LV_OBJ_FLAG_HIDDEN);
+      }
+      if (my_tick()-previousMillis >= ROTATION_TIMER_MS){
+        lv_image_set_rotation(coverImage, angleOfAlbum);
+        angleOfAlbum = (angleOfAlbum + ROTATION_STEP_DEG) % 3600;
+        previousMillis = my_tick();
+      }
     }
-    else{
+    else if (spinning) { // transition: stop and reset once
+      spinning = false;
       lv_image_set_rotation(coverImage, 0);
-      lv_obj_add_flag(blackCircle, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(spindleHub, LV_OBJ_FLAG_HIDDEN);
     }
 
     if (endPosition != 0){
       int progress = (currentPosition * 100) / endPosition;
       if (lastPosition != progress){
-        lv_arc_set_value(progressBar, progress);
+        lv_arc_set_value(progressRing, progress);
         lastPosition = progress;
       }
+    }
+  }
+  else { // track info known but the art hasn't finished downloading yet
+    if (strcmp(title, lastTitle) != 0 || strcmp(artist, lastArtist) != 0) {
+      updateLabels();
     }
   }
   lv_timer_handler();
@@ -460,12 +484,14 @@ void connect_to_wifi() {  // wifi connection
 
 
 void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles the websocket
-  Serial.printf(
-    "WS event=%d, length=%u, free heap=%u\n",
-    (int)type,
-    (unsigned int)length,
-    (unsigned int)ESP.getFreeHeap()
-  );
+  if (DEBUG_LOG) {
+    Serial.printf(
+      "WS event=%d, length=%u, free heap=%u\n",
+      (int)type,
+      (unsigned int)length,
+      (unsigned int)ESP.getFreeHeap()
+    );
+  }
   switch (type) {
     case WStype_CONNECTED:
     {
@@ -475,8 +501,8 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
       doc["BGColor"] = backgroundColor;
       doc["DisplayType"] = MUSICDISPLAYTYPE;
 
-      String message;
-      serializeJson(doc, message);
+      char message[64];
+      serializeJson(doc, message, sizeof(message));
 
       webSocket.sendTXT("GET SET UP");
       webSocket.sendTXT(message);
@@ -488,7 +514,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
 
     case WStype_TEXT:
       {
-        sendAction("SpeedTest"); // to test how long it takes to get and then send back info
+        // sendAction("SpeedTest"); // network tester is commented out on the server
         JsonDocument doc;
 
         DeserializationError error = deserializeJson(doc, payload, length);
@@ -501,13 +527,16 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
         if (doc["type"] == "media_update"){
           volume = doc["volume"] | 0;
           playing = doc["playing"] | false;
-          title = doc["title"] | "Unknown";
-          artist = doc["artist"] | "No Artist Available";
+          copyTrackField(title, sizeof(title), doc["title"] | "Unknown");
+          copyTrackField(artist, sizeof(artist), doc["artist"] | "No Artist Available");
           currentPosition = doc["currentPos"] | 1;
           endPosition = doc["endTime"] | 0;
+          haveTrackInfo = strcmp(title, "Unknown") != 0; // the PC's fallback for "no info"
 
-          Serial.println(doc["currentPos"].as<float>());
-          Serial.println(doc["endTime"].as<float>());
+          if (DEBUG_LOG) {
+            Serial.printf("pos %lu / %lu s\n",
+                          (unsigned long)currentPosition, (unsigned long)endPosition);
+          }
         }
         else if (doc["type"] == "imageSpecs") {
           widthOfImage = doc["width"] | 0;
@@ -537,12 +566,15 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
           Serial.printf("Allocated %u bytes\n",(unsigned int)albumDataSize);
 
           bytesReceived = 0;
+          applyImageGeometry(); // art size changed: re-fit the existing cover, if one is up
         }
         break;
       }
   case WStype_BIN: {
-     Serial.printf("Binary received: %u bytes\n",
-                  (unsigned int)length);
+    if (DEBUG_LOG) {
+      Serial.printf("Binary received: %u bytes\n",
+                    (unsigned int)length);
+    }
 
     if (albumData == nullptr) {
         Serial.println("ERROR: albumData is nullptr");
@@ -557,13 +589,19 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
     memcpy(albumData + bytesReceived, payload, length);
     bytesReceived += length;
 
-    Serial.printf("Received so far: %u / %u bytes\n",
-                  (unsigned int)bytesReceived,
-                  (unsigned int)albumDataSize);
+    if (DEBUG_LOG) {
+      Serial.printf("Received so far: %u / %u bytes\n",
+                    (unsigned int)bytesReceived,
+                    (unsigned int)albumDataSize);
+    }
 
     if (bytesReceived == albumDataSize) {
         Serial.println("Complete image received!");
         lvglCoverImage.data = albumData;
+        if (coverImage != nullptr) { // a cover is already on screen: push the new pixels
+          lv_image_set_src(coverImage, &lvglCoverImage);
+          applyImageGeometry();
+        }
     }
     break;
   } 
@@ -576,8 +614,8 @@ void sendAction(const char* action) { // use this to send messages to the python
   JsonDocument doc;
   doc["action"] = action;
 
-  String message;
-  serializeJson(doc, message);
+  char message[32];
+  serializeJson(doc, message, sizeof(message));
   Serial.println(message);
   webSocket.sendTXT(message);
 }
@@ -586,67 +624,39 @@ static uint32_t my_tick(void) {
   return millis();
 }
 
-static void fitArtToDisc(){ // scale the art so its larger side fills the 200px disc
-  uint16_t largest = lvglCoverImage.header.w > lvglCoverImage.header.h ? lvglCoverImage.header.w : lvglCoverImage.header.h;
-  if (largest == 0) largest = 1;
-  lv_image_set_scale(coverImage, 256 * VINYL_SIZE / largest); // 256 = 100% in LVGL v9
-}
-
-void initLVGLLabels(){
+void initVinylUI(){
   // progress ring around the record (created first so the art sits over its middle)
-  progressBar = lv_arc_create(lv_screen_active());
-  lv_obj_set_size(progressBar, RING_SIZE, RING_SIZE);
-  lv_obj_align(progressBar, LV_ALIGN_CENTER, 0, -DISTANCE_FROM_TOP);
-  lv_arc_set_bg_angles(progressBar, 0, 360); // full circle
-  lv_arc_set_range(progressBar, 0, 100);
-  lv_arc_set_value(progressBar, 0);
-  lv_obj_remove_style(progressBar, NULL, LV_PART_KNOB); // no knob
-  lv_obj_set_style_bg_opa(progressBar, LV_OPA_TRANSP, LV_PART_MAIN); // clear the middle, keep only the ring line
-  lv_obj_set_style_arc_color(progressBar, lv_color_hex(RING_TRACK), LV_PART_MAIN);
-  lv_obj_set_style_arc_width(progressBar, 3, LV_PART_MAIN);
-  lv_obj_set_style_arc_color(progressBar, lv_color_hex(RING_ACCENT), LV_PART_INDICATOR);
-  lv_obj_set_style_arc_width(progressBar, 4, LV_PART_INDICATOR);
-  lv_obj_set_style_arc_rounded(progressBar, true, LV_PART_MAIN);
-  lv_obj_set_style_arc_rounded(progressBar, true, LV_PART_INDICATOR);
+  progressRing = lv_arc_create(lv_screen_active());
+  lv_obj_set_size(progressRing, RING_SIZE, RING_SIZE);
+  lv_obj_align(progressRing, LV_ALIGN_CENTER, 0, -VINYL_Y_OFFSET);
+  lv_arc_set_bg_angles(progressRing, 0, 360); // full circle
+  lv_arc_set_range(progressRing, 0, 100);
+  lv_arc_set_value(progressRing, 0);
+  lv_obj_remove_style(progressRing, nullptr, LV_PART_KNOB); // no knob
+  lv_obj_set_style_bg_opa(progressRing, LV_OPA_TRANSP, LV_PART_MAIN); // clear the middle, keep only the ring line
+  lv_obj_set_style_arc_color(progressRing, lv_color_hex(RING_TRACK), LV_PART_MAIN);
+  lv_obj_set_style_arc_width(progressRing, 3, LV_PART_MAIN);
+  lv_obj_set_style_arc_color(progressRing, lv_color_hex(RING_ACCENT), LV_PART_INDICATOR);
+  lv_obj_set_style_arc_width(progressRing, 4, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_rounded(progressRing, true, LV_PART_MAIN);
+  lv_obj_set_style_arc_rounded(progressRing, true, LV_PART_INDICATOR);
 
   // circular clipping container: the album art becomes the record
-  vinylDisc = lv_obj_create(lv_screen_active());
-  lv_obj_set_size(vinylDisc, VINYL_SIZE, VINYL_SIZE);
-  lv_obj_align(vinylDisc, LV_ALIGN_CENTER, 0, -DISTANCE_FROM_TOP);
-  lv_obj_set_style_radius(vinylDisc, LV_RADIUS_CIRCLE, 0);
+  vinylDisc = makeDisc(lv_screen_active(), VINYL_SIZE, BLACK);
+  lv_obj_align(vinylDisc, LV_ALIGN_CENTER, 0, -VINYL_Y_OFFSET);
   lv_obj_set_style_clip_corner(vinylDisc, true, 0); // clip children to the circle
-  lv_obj_set_style_bg_color(vinylDisc, lv_color_black(), 0);
-  lv_obj_set_style_bg_opa(vinylDisc, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(vinylDisc, 0, 0);
-  lv_obj_set_style_pad_all(vinylDisc, 0, 0);
-  lv_obj_remove_flag(vinylDisc, LV_OBJ_FLAG_SCROLLABLE);
 
   coverImage = lv_image_create(vinylDisc);
   lv_image_set_src(coverImage, &lvglCoverImage);
   lv_obj_align(coverImage, LV_ALIGN_CENTER, 0, 0);
-  fitArtToDisc();
-  lv_image_set_pivot(coverImage, lvglCoverImage.header.w/2, lvglCoverImage.header.h/2);
+  applyImageGeometry();
 
   // spindle: small dark hub with a tiny center dot, on top of the rotating art
-  blackCircle = lv_obj_create(lv_screen_active());
-  lv_obj_set_size(blackCircle, 26, 26);
-  lv_obj_align(blackCircle, LV_ALIGN_CENTER, 0, -DISTANCE_FROM_TOP);
-  lv_obj_set_style_radius(blackCircle, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(blackCircle, lv_color_hex(0x0A0A0A), 0);
-  lv_obj_set_style_bg_opa(blackCircle, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(blackCircle, 0, 0);
-  lv_obj_set_style_pad_all(blackCircle, 0, 0);
-  lv_obj_remove_flag(blackCircle, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_t *spindleDot = lv_obj_create(blackCircle);
-  lv_obj_set_size(spindleDot, 5, 5);
+  spindleHub = makeDisc(lv_screen_active(), 26, 0x0A0A0A);
+  lv_obj_align(spindleHub, LV_ALIGN_CENTER, 0, -VINYL_Y_OFFSET);
+  lv_obj_t *spindleDot = makeDisc(spindleHub, 5, 0x8A8A8A);
   lv_obj_align(spindleDot, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_set_style_radius(spindleDot, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(spindleDot, lv_color_hex(0x8A8A8A), 0);
-  lv_obj_set_style_bg_opa(spindleDot, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(spindleDot, 0, 0);
-  lv_obj_set_style_pad_all(spindleDot, 0, 0);
-  lv_obj_remove_flag(spindleDot, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_add_flag(blackCircle, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(spindleHub, LV_OBJ_FLAG_HIDDEN);
 
   // strip and text belong on top of the art
   lv_obj_move_foreground(textStrip);
@@ -654,34 +664,31 @@ void initLVGLLabels(){
   lv_obj_move_foreground(nameOfArtist);
 }
 
-void updateLabels(){ // updates every loop (there is an image)
-  lv_image_set_src(coverImage, &lvglCoverImage);
-  fitArtToDisc();
-  lv_image_set_pivot(coverImage, lvglCoverImage.header.w/2, lvglCoverImage.header.h/2);
-  lastTitle = title;
-  lastArtist = artist;
+void updateLabels(){ // refresh the track text (image geometry is applied when specs/binary arrive)
+  strcpy(lastTitle, title);
+  strcpy(lastArtist, artist);
   lv_obj_add_flag(placeHolderCover, LV_OBJ_FLAG_HIDDEN);
-  lv_label_set_text(nameOfSong, title.c_str());
+  lv_label_set_text(nameOfSong, title);
   lv_obj_set_pos(nameOfSong, 8, 188);
   lv_obj_set_style_text_font(nameOfSong, &lv_font_montserrat_14, LV_PART_MAIN);
   lv_obj_set_style_text_color(nameOfSong, lv_color_make(255, 255, 255), LV_PART_MAIN);
 
-  lv_label_set_text(nameOfArtist, artist.c_str());
+  lv_label_set_text(nameOfArtist, artist);
   lv_obj_set_pos(nameOfArtist, 8, 208);
   lv_obj_set_style_text_font(nameOfArtist, &lv_font_montserrat_10, LV_PART_MAIN);
   lv_obj_set_style_text_color(nameOfArtist, lv_color_make(160, 160, 160), LV_PART_MAIN);
 }
 
 void setUnknownLabels(){
-    // no album art yet: show the blank drawn vinyl disc instead of a bitmap
+    // no track info yet: show the blank drawn vinyl disc instead of a bitmap
     lv_obj_remove_flag(placeHolderCover, LV_OBJ_FLAG_HIDDEN);
 
-    lv_label_set_text(nameOfSong, title.c_str());
+    lv_label_set_text(nameOfSong, title);
     lv_obj_set_pos(nameOfSong, 8, 188);
     lv_obj_set_style_text_font(nameOfSong, &lv_font_montserrat_14, LV_PART_MAIN);
     lv_obj_set_style_text_color(nameOfSong, lv_color_make(255, 255, 255), LV_PART_MAIN);
 
-    lv_label_set_text(nameOfArtist, artist.c_str());
+    lv_label_set_text(nameOfArtist, artist);
     lv_obj_set_pos(nameOfArtist, 8, 208);
     lv_obj_set_style_text_font(nameOfArtist, &lv_font_montserrat_10, LV_PART_MAIN);
     lv_obj_set_style_text_color(nameOfArtist, lv_color_make(160, 160, 160), LV_PART_MAIN);
