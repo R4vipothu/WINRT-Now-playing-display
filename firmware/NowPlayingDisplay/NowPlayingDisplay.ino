@@ -51,17 +51,117 @@
 #define STRIP_HEIGHT 58         // bottom text strip
 #define STRIP_CORE_HEIGHT 34    // denser lower band of the strip
 
-// ---- rotary knob (pot + push switch) ----
-#define POT_PIN 34            // potentiometer wiper; ADC1 only - ADC2 can't run while WiFi is on
-#define BTN_PIN 27            // push switch wired to GND, read with INPUT_PULLUP
-#define POT_SAMPLES 8         // moving-average window for the ADC
-#define POT_DEADBAND_PCT 2    // ignore volume changes smaller than this (jitter)
+/*
+ * ----------------------------------------------------------------
+ * Rotary encoder with push switch (e.g. KY-040 module)
+ * ----------------------------------------------------------------
+ *
+ * Physical pins on the module (5 pins total):
+ *
+ *   Pin   Function         Description
+ *   ----  ---------------  ------------------------------------------
+ *   CLK   Channel A        One of two quadrature output signals. The
+ *                          CLK and DT pins together produce a Gray-code
+ *                          sequence as the shaft turns. By comparing
+ *                          which pin changes first, firmware can tell
+ *                          the direction of rotation (clockwise vs.
+ *                          counter-clockwise).
+ *
+ *   DT    Channel B        The second quadrature signal. When CLK
+ *                          leads DT the shaft is turning one way;
+ *                          when DT leads CLK it is turning the other.
+ *
+ *   SW    Push switch      Momentary, normally-open button built into
+ *                          the shaft. Pressing the knob closes SW to
+ *                          GND. We read it with INPUT_PULLUP so the
+ *                          idle state is HIGH and a press reads LOW.
+ *
+ *   +     VCC / 3.3 V      Power for the on-board pull-up resistors
+ *                          (the KY-040 has 10 kΩ pull-ups on CLK and
+ *                          DT). Connect to the ESP32's 3.3 V rail.
+ *                          Some clones label this "VCC" instead of "+".
+ *
+ *   GND   Ground           Common ground shared with the ESP32.
+ *
+ * Wiring to the ESP32:
+ *
+ *   Module pin  →  ESP32 GPIO  Notes
+ *   ----------     ----------  -----
+ *   CLK         →  GPIO 34     Read as analog (ADC1_CH6). GPIO 34 is
+ *                               input-only on the ESP32.  *See note below.*
+ *   DT          →  (unused)    Not currently wired; rotation direction
+ *                               is not decoded in this firmware.
+ *   SW          →  GPIO 27     Digital input with internal pull-up.
+ *                               Directly connects SW ↔ GPIO 27; the
+ *                               other side of the switch goes to GND
+ *                               through the module's ground pin.
+ *   +           →  3.3 V       Powers the module's pull-up network.
+ *   GND         →  GND         Common ground.
+ *
+ * ┌────────────────────────────────────────────────────────────────┐
+ * │  IMPORTANT — analog vs. quadrature                            │
+ * │                                                               │
+ * │  This firmware reads the CLK pin with analogRead(), treating  │
+ * │  the encoder as a simple potentiometer. A true rotary encoder │
+ * │  outputs digital HIGH/LOW quadrature pulses, NOT a smooth     │
+ * │  analog voltage. The analogRead() approach works in practice  │
+ * │  only because:                                                │
+ * │    • The KY-040's internal pull-up and the ESP32's ADC see    │
+ * │      a resting voltage near VCC between detents, and each     │
+ * │      click briefly pulls the line low.                        │
+ * │    • The moving-average filter and deadband hide the noisy    │
+ * │      transitions.                                             │
+ * │                                                               │
+ * │  If volume control feels jittery or only moves in one         │
+ * │  direction, consider switching to a proper quadrature decoder │
+ * │  that digitalReads both CLK and DT on CHANGE interrupts      │
+ * │  (libraries: ESP32Encoder, AiEsp32RotaryEncoder).             │
+ * └────────────────────────────────────────────────────────────────┘
+ *
+ * Volume control (CLK / analog):
+ *   - The ADC is sampled every POT_READ_MS milliseconds.
+ *   - Readings are smoothed with a POT_SAMPLES-wide moving average.
+ *   - Changes smaller than POT_DEADBAND_PCT (% of full range) are
+ *     ignored to filter ADC jitter on the ESP32.
+ *   - While the knob is turning, volume messages are throttled to
+ *     one every VOLUME_SEND_MS. After the knob stops, a final
+ *     "settle" send fires VOLUME_SETTLE_MS later to guarantee the
+ *     last value is never lost.
+ *   - On-screen, a "Vol XX%" label pops up and auto-hides ~1 s
+ *     after the last change.
+ *
+ * Push-button gestures (SW / digital):
+ *   Gesture          Action sent to PC   Detection
+ *   ───────────────  ──────────────────   ──────────────────────
+ *   Short press      PlayPause            One tap with no second
+ *                                         tap within GESTURE_WINDOW_MS.
+ *   Double press     Next                 Two taps within
+ *                                         GESTURE_WINDOW_MS of each
+ *                                         other.
+ *   Long press       Previous             Held longer than
+ *                                         LONGPRESS_MS. Fires once
+ *                                         at the threshold, not on
+ *                                         release. Also cancels any
+ *                                         pending single-tap.
+ *
+ *   Debouncing: state changes are ignored for BTN_DEBOUNCE_MS after
+ *   the raw pin value flips. This prevents mechanical contact bounce
+ *   from registering as multiple presses.
+ *
+ * None of this code blocks; everything is millis()-based so the
+ * LVGL tick and the WebSocket pump in loop() keep running.
+ * ----------------------------------------------------------------
+ */
+#define POT_PIN 34            // encoder CLK → ADC1_CH6 (input-only pin; ADC2 unavailable during WiFi)
+#define BTN_PIN 27            // encoder SW  → digital in with INPUT_PULLUP; pressed = LOW
+#define POT_SAMPLES 8         // moving-average window for ADC smoothing
+#define POT_DEADBAND_PCT 2    // ignore volume changes smaller than this % (ADC jitter filter)
 #define POT_READ_MS 10        // fixed ADC sampling cadence, independent of loop speed
-#define VOLUME_SEND_MS 100    // throttle for volume messages while turning
+#define VOLUME_SEND_MS 100    // throttle: at most one volume message per this many ms while turning
 #define VOLUME_SETTLE_MS 150  // always send the final value this long after rotation stops
-#define BTN_DEBOUNCE_MS 40
+#define BTN_DEBOUNCE_MS 40    // ignore pin-state flips shorter than this (contact bounce filter)
 #define GESTURE_WINDOW_MS 350 // max gap between two taps that counts as a double press
-#define LONGPRESS_MS 600      // hold longer than this = previous track
+#define LONGPRESS_MS 600      // hold longer than this = "Previous" track (fires once at threshold)
 
 #define DRAW_BUF_SIZE (TFT_HOR_RES * TFT_VER_RES / 24 * (LV_COLOR_DEPTH / 8))
 uint32_t draw_buf[DRAW_BUF_SIZE / 4];
@@ -160,9 +260,9 @@ void setup() {
   pinMode(21, OUTPUT);
   digitalWrite(21, HIGH);
 
-  // rotary knob inputs
-  pinMode(POT_PIN, INPUT);        // GPIO34 is input-only; used purely as ADC1
-  pinMode(BTN_PIN, INPUT_PULLUP); // switch between BTN_PIN and GND
+  // Rotary encoder inputs (see the detailed hardware docs above the #defines)
+  pinMode(POT_PIN, INPUT);        // CLK line → GPIO 34, input-only pin; read as ADC1_CH6
+  pinMode(BTN_PIN, INPUT_PULLUP); // SW  line → GPIO 27; switch shorts to GND on press
 
   //display configuration
   Serial.println("Starting intialization");
@@ -251,28 +351,30 @@ void setup() {
 }
 
 // ============================================================
-// Rotary knob: pot = volume, push switch = playback gestures.
+// Rotary encoder service: CLK → volume (analog), SW → gestures.
+// See the detailed pin-out and wiring docs above the #defines.
 // Everything is millis()-based; never blocks the LVGL tick or
 // the WebSocket pump in loop().
 // ============================================================
-static uint16_t potWindow[POT_SAMPLES]; // moving-average window
-static uint8_t potIdx = 0;
-static uint32_t potSum = 0;
+static uint16_t potWindow[POT_SAMPLES]; // moving-average ring buffer for ADC smoothing
+static uint8_t potIdx = 0;              // next write position in the ring buffer
+static uint32_t potSum = 0;             // running sum of the window for O(1) average
 
-static int lastVolumeSeen = -1;         // latest deadbanded reading
-static int lastVolumeSent = -1;         // last value actually sent to the PC
-static unsigned long lastVolumeSend = 0;
-static unsigned long lastPotMove = 0;
-static unsigned long lastPotRead = 0;
-static bool volumeFinalPending = false; // a throttled change still needs its final send
+static int lastVolumeSeen = -1;         // latest deadbanded reading (-1 = no reading yet)
+static int lastVolumeSent = -1;         // last value actually transmitted to the PC
+static unsigned long lastVolumeSend = 0; // millis() of the last volume WebSocket send
+static unsigned long lastPotMove = 0;    // millis() of the last above-deadband change
+static unsigned long lastPotRead = 0;    // millis() of the last ADC sample
+static bool volumeFinalPending = false;  // a throttled change still needs its "settle" send
 
-static bool btnLastRaw = false;
-static bool btnPressed = false;         // debounced state, true = pressed
-static unsigned long btnChangeAt = 0;
-static unsigned long pressStartAt = 0;
-static bool longPressFired = false;
-static bool waitingSecondTap = false;
-static unsigned long windowStartAt = 0;
+// --- push-button (SW pin) state machine ---
+static bool btnLastRaw = false;          // last raw digitalRead value (before debounce)
+static bool btnPressed = false;          // debounced state: true = button is held down
+static unsigned long btnChangeAt = 0;    // millis() when the raw value last changed
+static unsigned long pressStartAt = 0;   // millis() when the current press began
+static bool longPressFired = false;      // has the long-press action already fired this hold?
+static bool waitingSecondTap = false;    // first tap seen; waiting to see if a second follows
+static unsigned long windowStartAt = 0;  // millis() when the double-tap window opened
 
 static lv_obj_t *volumeLabel = nullptr; // stretch goal: tiny on-screen volume readout
 static unsigned long volumeLabelHideAt = 0;
@@ -312,7 +414,8 @@ static void showVolumeLabel(int pct) {
 static void serviceKnob() {
   unsigned long now = millis();
 
-  // ---- volume: sample on a fixed cadence -> smooth -> deadband -> throttle ----
+  // ---- VOLUME (CLK pin via analogRead) ----
+  // Sample → smooth → deadband → throttle → settle
   if (now - lastPotRead >= POT_READ_MS) {
     lastPotRead = now;
     potSum -= potWindow[potIdx];
@@ -349,8 +452,8 @@ static void serviceKnob() {
     volumeFinalPending = false;
   }
 
-  // ---- button: debounce + tap / double tap / hold ----
-  bool raw = digitalRead(BTN_PIN) == LOW; // INPUT_PULLUP: pressed = LOW
+  // ---- PUSH BUTTON (SW pin): debounce → tap / double-tap / long-press ----
+  bool raw = digitalRead(BTN_PIN) == LOW; // INPUT_PULLUP: idle HIGH, pressed LOW
   if (raw != btnLastRaw) {
     btnLastRaw = raw;
     btnChangeAt = now;
