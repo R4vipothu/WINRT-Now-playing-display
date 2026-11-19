@@ -56,79 +56,20 @@
  * Rotary encoder with push switch (e.g. KY-040 module)
  * ----------------------------------------------------------------
  *
- * Physical pins on the module (5 pins total):
+ * Physical pins:
+ *   CLK → GPIO34, digital quadrature channel A
+ *   DT  → GPIO26, digital quadrature channel B
+ *   SW  → GPIO27, momentary switch to GND (INPUT_PULLUP)
+ *   +   → 3.3 V
+ *   GND → ESP32 GND
  *
- *   Pin   Function         Description
- *   ----  ---------------  ------------------------------------------
- *   CLK   Channel A        One of two quadrature output signals. The
- *                          CLK and DT pins together produce a Gray-code
- *                          sequence as the shaft turns. By comparing
- *                          which pin changes first, firmware can tell
- *                          the direction of rotation (clockwise vs.
- *                          counter-clockwise).
- *
- *   DT    Channel B        The second quadrature signal. When CLK
- *                          leads DT the shaft is turning one way;
- *                          when DT leads CLK it is turning the other.
- *
- *   SW    Push switch      Momentary, normally-open button built into
- *                          the shaft. Pressing the knob closes SW to
- *                          GND. We read it with INPUT_PULLUP so the
- *                          idle state is HIGH and a press reads LOW.
- *
- *   +     VCC / 3.3 V      Power for the on-board pull-up resistors
- *                          (the KY-040 has 10 kΩ pull-ups on CLK and
- *                          DT). Connect to the ESP32's 3.3 V rail.
- *                          Some clones label this "VCC" instead of "+".
- *
- *   GND   Ground           Common ground shared with the ESP32.
- *
- * Wiring to the ESP32:
- *
- *   Module pin  →  ESP32 GPIO  Notes
- *   ----------     ----------  -----
- *   CLK         →  GPIO 34     Read as analog (ADC1_CH6). GPIO 34 is
- *                               input-only on the ESP32.  *See note below.*
- *   DT          →  (unused)    Not currently wired; rotation direction
- *                               is not decoded in this firmware.
- *   SW          →  GPIO 27     Digital input with internal pull-up.
- *                               Directly connects SW ↔ GPIO 27; the
- *                               other side of the switch goes to GND
- *                               through the module's ground pin.
- *   +           →  3.3 V       Powers the module's pull-up network.
- *   GND         →  GND         Common ground.
- *
- * ┌────────────────────────────────────────────────────────────────┐
- * │  IMPORTANT — analog vs. quadrature                            │
- * │                                                               │
- * │  This firmware reads the CLK pin with analogRead(), treating  │
- * │  the encoder as a simple potentiometer. A true rotary encoder │
- * │  outputs digital HIGH/LOW quadrature pulses, NOT a smooth     │
- * │  analog voltage. The analogRead() approach works in practice  │
- * │  only because:                                                │
- * │    • The KY-040's internal pull-up and the ESP32's ADC see    │
- * │      a resting voltage near VCC between detents, and each     │
- * │      click briefly pulls the line low.                        │
- * │    • The moving-average filter and deadband hide the noisy    │
- * │      transitions.                                             │
- * │                                                               │
- * │  If volume control feels jittery or only moves in one         │
- * │  direction, consider switching to a proper quadrature decoder │
- * │  that digitalReads both CLK and DT on CHANGE interrupts      │
- * │  (libraries: ESP32Encoder, AiEsp32RotaryEncoder).             │
- * └────────────────────────────────────────────────────────────────┘
- *
- * Volume control (CLK / analog):
- *   - The ADC is sampled every POT_READ_MS milliseconds.
- *   - Readings are smoothed with a POT_SAMPLES-wide moving average.
- *   - Changes smaller than POT_DEADBAND_PCT (% of full range) are
- *     ignored to filter ADC jitter on the ESP32.
- *   - While the knob is turning, volume messages are throttled to
- *     one every VOLUME_SEND_MS. After the knob stops, a final
- *     "settle" send fires VOLUME_SETTLE_MS later to guarantee the
- *     last value is never lost.
- *   - On-screen, a "Vol XX%" label pops up and auto-hides ~1 s
- *     after the last change.
+ * Volume control (CLK / DT quadrature):
+ *   - Both digital channels are read on every CHANGE interrupt.
+ *   - The Gray-code sequence is decoded with an 16-entry transition
+ *     table. Each accepted detent changes volume by ENC_STEP_PCT.
+ *   - Volume messages are throttled to VOLUME_SEND_MS while turning.
+ *     VOLUME_SETTLE_MS after the final detent sends the final value.
+ *   - On-screen, a "Vol XX%" label pops up and auto-hides ~1 s.
  *
  * Push-button gestures (SW / digital):
  *   Gesture          Action sent to PC   Detection
@@ -152,16 +93,15 @@
  * LVGL tick and the WebSocket pump in loop() keep running.
  * ----------------------------------------------------------------
  */
-#define POT_PIN 34            // encoder CLK → ADC1_CH6 (input-only pin; ADC2 unavailable during WiFi)
-#define BTN_PIN 27            // encoder SW  → digital in with INPUT_PULLUP; pressed = LOW
-#define POT_SAMPLES 8         // moving-average window for ADC smoothing
-#define POT_DEADBAND_PCT 2    // ignore volume changes smaller than this % (ADC jitter filter)
-#define POT_READ_MS 10        // fixed ADC sampling cadence, independent of loop speed
+#define ENC_CLK_PIN 34        // encoder CLK → GPIO34, digital input (not ADC)
+#define ENC_DT_PIN 26         // encoder DT  → GPIO26, digital input
+#define BTN_PIN 27            // encoder SW  → GPIO27, input with INPUT_PULLUP
+#define ENC_STEP_PCT 2        // volume change per accepted encoder detent
 #define VOLUME_SEND_MS 100    // throttle: at most one volume message per this many ms while turning
-#define VOLUME_SETTLE_MS 150  // always send the final value this long after rotation stops
+#define VOLUME_SETTLE_MS 150  // send the final value this long after rotation stops
 #define BTN_DEBOUNCE_MS 40    // ignore pin-state flips shorter than this (contact bounce filter)
-#define GESTURE_WINDOW_MS 350 // max gap between two taps that counts as a double press
-#define LONGPRESS_MS 600      // hold longer than this = "Previous" track (fires once at threshold)
+#define GESTURE_WINDOW_MS 500 // max gap between two taps that counts as a double press
+#define LONGPRESS_MS 600      // hold longer than this = "Previous" track
 
 #define DRAW_BUF_SIZE (TFT_HOR_RES * TFT_VER_RES / 24 * (LV_COLOR_DEPTH / 8))
 uint32_t draw_buf[DRAW_BUF_SIZE / 4];
@@ -261,8 +201,11 @@ void setup() {
   digitalWrite(21, HIGH);
 
   // Rotary encoder inputs (see the detailed hardware docs above the #defines)
-  pinMode(POT_PIN, INPUT);        // CLK line → GPIO 34, input-only pin; read as ADC1_CH6
-  pinMode(BTN_PIN, INPUT_PULLUP); // SW  line → GPIO 27; switch shorts to GND on press
+  pinMode(ENC_CLK_PIN, INPUT_PULLUP); // CLK → GPIO34, quadrature channel A
+  pinMode(ENC_DT_PIN, INPUT_PULLUP);  // DT  → GPIO26, quadrature channel B
+  pinMode(BTN_PIN, INPUT_PULLUP);     // SW  → GPIO27; switch shorts to GND on press
+  attachInterrupt(digitalPinToInterrupt(ENC_CLK_PIN), handleEncoderInterrupt, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_DT_PIN), handleEncoderInterrupt, CHANGE);
 
   //display configuration
   Serial.println("Starting intialization");
@@ -351,21 +294,35 @@ void setup() {
 }
 
 // ============================================================
-// Rotary encoder service: CLK → volume (analog), SW → gestures.
-// See the detailed pin-out and wiring docs above the #defines.
-// Everything is millis()-based; never blocks the LVGL tick or
-// the WebSocket pump in loop().
+// Rotary encoder service: CLK/DT → volume, SW → gestures.
+// CLK and DT are decoded digitally as quadrature. Each accepted
+// detent changes volume by ENC_STEP_PCT; no ADC jitter or library is needed.
+// Everything is millis()-based; never blocks LVGL or the WebSocket pump.
 // ============================================================
-static uint16_t potWindow[POT_SAMPLES]; // moving-average ring buffer for ADC smoothing
-static uint8_t potIdx = 0;              // next write position in the ring buffer
-static uint32_t potSum = 0;             // running sum of the window for O(1) average
+static int encoderVolume = 50;          // device volume before the server reports its actual level
+static int lastVolumeSent = 50;
+static unsigned long lastVolumeSend = 0;
+static unsigned long lastEncoderMove = 0;
+static bool volumeFinalPending = false;
 
-static int lastVolumeSeen = -1;         // latest deadbanded reading (-1 = no reading yet)
-static int lastVolumeSent = -1;         // last value actually transmitted to the PC
-static unsigned long lastVolumeSend = 0; // millis() of the last volume WebSocket send
-static unsigned long lastPotMove = 0;    // millis() of the last above-deadband change
-static unsigned long lastPotRead = 0;    // millis() of the last ADC sample
-static bool volumeFinalPending = false;  // a throttled change still needs its "settle" send
+static uint8_t encoderLastState = 0;
+volatile static int8_t encoderDelta = 0;
+
+void IRAM_ATTR handleEncoderInterrupt() {
+  uint8_t state = (digitalRead(ENC_CLK_PIN) << 1) | digitalRead(ENC_DT_PIN);
+  uint8_t transition = (encoderLastState << 2) | state;
+
+  // Standard 16-entry Gray-code decoder. Add only complete valid transitions;
+  // bounce and invalid mid-state combinations contribute nothing.
+  static const int8_t encoderTable[16] = {
+     0, -1,  1,  0,
+     1,  0,  0, -1,
+    -1,  0,  0,  1,
+     0,  1, -1,  0
+  };
+  encoderDelta += encoderTable[transition];
+  encoderLastState = state;
+}
 
 // --- push-button (SW pin) state machine ---
 static bool btnLastRaw = false;          // last raw digitalRead value (before debounce)
@@ -414,40 +371,31 @@ static void showVolumeLabel(int pct) {
 static void serviceKnob() {
   unsigned long now = millis();
 
-  // ---- VOLUME (CLK pin via analogRead) ----
-  // Sample → smooth → deadband → throttle → settle
-  if (now - lastPotRead >= POT_READ_MS) {
-    lastPotRead = now;
-    potSum -= potWindow[potIdx];
-    potWindow[potIdx] = analogRead(POT_PIN);
-    potSum += potWindow[potIdx];
-    potIdx = (potIdx + 1) % POT_SAMPLES;
-    int pct = constrain(map((int)(potSum / POT_SAMPLES), 0, 4095, 0, 100), 0, 100);
+  // ---- VOLUME (CLK/DT quadrature) ----
+  noInterrupts();
+  int8_t delta = encoderDelta;
+  encoderDelta = 0;
+  interrupts();
 
-    if (lastVolumeSeen < 0) { // first reading after boot: adopt silently, don't spam the PC
-      lastVolumeSeen = pct;
-      lastVolumeSent = pct;
-    }
-    else if (abs(pct - lastVolumeSeen) >= POT_DEADBAND_PCT) { // deadband
-      lastVolumeSeen = pct;
-      lastPotMove = now;
-      showVolumeLabel(lastVolumeSeen);
-      if (now - lastVolumeSend >= VOLUME_SEND_MS) { // throttle while turning
-        sendVolume(lastVolumeSeen);
-        lastVolumeSent = lastVolumeSeen;
+  if (delta != 0) {
+    int nextVolume = constrain(encoderVolume + (delta * ENC_STEP_PCT), 0, 100);
+    if (nextVolume != encoderVolume) {
+      encoderVolume = nextVolume;
+      lastVolumeSent = encoderVolume;
+      lastEncoderMove = now;
+      showVolumeLabel(encoderVolume);
+
+      if (now - lastVolumeSend >= VOLUME_SEND_MS) {
+        sendVolume(encoderVolume);
         lastVolumeSend = now;
         volumeFinalPending = false;
-      }
-      else {
+      } else {
         volumeFinalPending = true;
       }
     }
   }
-  if (volumeFinalPending && now - lastPotMove >= VOLUME_SETTLE_MS) { // final value after settling
-    if (lastVolumeSeen != lastVolumeSent) {
-      sendVolume(lastVolumeSeen);
-    }
-    lastVolumeSent = lastVolumeSeen;
+  if (volumeFinalPending && now - lastEncoderMove >= VOLUME_SETTLE_MS) {
+    sendVolume(encoderVolume);
     lastVolumeSend = now;
     volumeFinalPending = false;
   }
@@ -629,6 +577,10 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
 
         if (doc["type"] == "media_update"){
           volume = doc["volume"] | 0;
+          if (!volumeFinalPending) {
+            encoderVolume = constrain((int)volume, 0, 100);
+            lastVolumeSent = encoderVolume;
+          }
           playing = doc["playing"] | false;
           copyTrackField(title, sizeof(title), doc["title"] | "Unknown");
           copyTrackField(artist, sizeof(artist), doc["artist"] | "No Artist Available");

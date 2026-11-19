@@ -11,7 +11,11 @@ from concurrent.futures import ThreadPoolExecutor # Used to help with the COM is
 from datetime import datetime
 
 from websockets import ConnectionClosed
-from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager, GlobalSystemMediaTransportControlsSessionPlaybackStatus
+from winrt.windows.media.control import (
+    GlobalSystemMediaTransportControlsSessionManager,
+    GlobalSystemMediaTransportControlsSessionPlaybackStatus,
+    GlobalSystemMediaTransportControlsSessionPlaybackControls,
+)
 from winrt.windows.storage.streams import DataReader
 
 import json
@@ -155,15 +159,38 @@ def _send_media_key(vk):
         inputs[i].union.ki = KEYBDINPUT(vk, 0, flags, 0, ctypes.pointer(extra))
     ctypes.windll.user32.SendInput(2, inputs, ctypes.sizeof(INPUT))
 
-async def playPause():
+async def playPause(media_controller=None):
+    if media_controller is not None:
+        session = media_controller.get_current_session()
+        if session is not None:
+            controls = session.get_controls()
+            if controls.is_play_pause_toggle_enabled:
+                await session.try_toggle_play_pause_async()
+                return
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(audio_pool, _send_media_key, VK_MEDIA_PLAY_PAUSE)
 
-async def nextTrack():
+async def nextTrack(media_controller=None):
+    if media_controller is not None:
+        session = media_controller.get_current_session()
+        if session is not None:
+            controls = session.get_controls()
+            if controls.is_next_enabled:
+                result = await session.try_skip_next_async()
+                if result:  # bool-like WinRT operation result
+                    return
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(audio_pool, _send_media_key, VK_MEDIA_NEXT_TRACK)
 
-async def previousTrack():
+async def previousTrack(media_controller=None):
+    if media_controller is not None:
+        session = media_controller.get_current_session()
+        if session is not None:
+            controls = session.get_controls()
+            if controls.is_previous_enabled:
+                result = await session.try_skip_previous_async()
+                if result:
+                    return
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(audio_pool, _send_media_key, VK_MEDIA_PREV_TRACK)
 
@@ -329,13 +356,13 @@ async def handle_client(websocket): #set up websocket
                                 await setVolume(level)
                                 print("Volume ->", round(level * 100))
                             elif data["action"] == "PlayPause":
-                                await playPause()
+                                await playPause(mediaController)
                                 print("PlayPause")
                             elif data["action"] == "Next":
-                                await nextTrack()
+                                await nextTrack(mediaController)
                                 print("Next")
                             elif data["action"] == "Previous":
-                                await previousTrack()
+                                await previousTrack(mediaController)
                                 print("Previous")
                             # --- network tester commented out ---
                             # if data["action"] == "SpeedTest":
