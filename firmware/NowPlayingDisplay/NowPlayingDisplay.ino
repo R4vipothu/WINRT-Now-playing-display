@@ -187,6 +187,16 @@ static void copyTrackField(char *dst, size_t cap, const char *src) { // bounded 
   dst[cap - 1] = '\0';
 }
 
+// Forward declarations
+void IRAM_ATTR handleEncoderInterrupt();
+static uint32_t my_tick(void);
+void connect_to_wifi();
+void webSocketEvent(WStype_t type, uint8_t* payload, size_t length);
+void sendAction(const char* action);
+void initVinylUI();
+void updateLabels();
+void setUnknownLabels();
+
 void setup() {
   Serial.begin(115200);
   delay(5000);
