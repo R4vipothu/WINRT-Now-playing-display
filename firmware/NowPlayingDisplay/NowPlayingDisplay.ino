@@ -319,7 +319,8 @@ static uint8_t encoderLastState = 0;
 volatile static int8_t encoderDelta = 0;
 
 void IRAM_ATTR handleEncoderInterrupt() {
-  uint8_t state = (digitalRead(ENC_CLK_PIN) << 1) | digitalRead(ENC_DT_PIN);
+  // DT in the high bit so clockwise → positive delta (swap if your knob is reversed)
+  uint8_t state = (digitalRead(ENC_DT_PIN) << 1) | digitalRead(ENC_CLK_PIN);
   uint8_t transition = (encoderLastState << 2) | state;
 
   // Standard 16-entry Gray-code decoder. Add only complete valid transitions;
