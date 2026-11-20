@@ -60,7 +60,7 @@
  *   VRY/Y  → GPIO32, analog vertical axis (ADC1)
  *   VRX/X  → GPIO35, analog horizontal axis (ADC1)
  *   SW     → GPIO27, momentary switch to GND (INPUT_PULLUP)
- *   VCC/+  → ESP32 VIN (5 V supply rail)
+ *   VCC/+  → ESP32 3V3 (do not use VIN/5 V: ADC pins are 3.3 V maximum)
  *   GND    → ESP32 GND
  *
  * Volume and direction controls:
