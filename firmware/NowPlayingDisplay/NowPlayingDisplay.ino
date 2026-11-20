@@ -90,6 +90,7 @@
 #define VOLUME_SEND_MS 100    // throttle: at most one volume message per this many ms while turning
 #define VOLUME_SETTLE_MS 150  // send the final value this long after rotation stops
 #define JOY_DEADZONE 900      // high threshold: must be clearly displaced from neutral
+#define JOY_RETURN_DEADZONE 500 // hysteresis: return halfway toward center before changing axis
 #define JOY_REPEAT_MS 160     // volume repeat delay while held away from center
 #define JOY_DIRECTION_MS 220  // minimum hold before an edge direction is accepted
 #define JOY_CLICK_DEBOUNCE_MS 50
@@ -292,6 +293,7 @@ static int lastVolumeSent = 50;
 static unsigned long lastVolumeSend = 0;
 static unsigned long lastJoystickMove = 0;
 static bool volumeFinalPending = false;
+static unsigned long joystickVolumeLockUntil = 0;
 
 static int joyNeutralX = 2048;
 static int joyNeutralY = 2048;
@@ -300,6 +302,7 @@ static char activeAxis = 0;
 static unsigned long axisStartAt = 0;
 static unsigned long nextVolumeRepeatAt = 0;
 static bool axisActionFired = false;
+static unsigned long lastJoyDebugAt = 0;
 
 static bool btnLastRaw = false;
 static bool btnPressed = false;
@@ -348,22 +351,46 @@ static void serviceJoystick() {
   int x = analogRead(JOY_X_PIN);
   int y = analogRead(JOY_Y_PIN);
 
-  // First read establishes mechanical center. 900-unit deadzone prevents
-  // half-swipes, noisy center readings, and diagonal false starts.
+  // Establish center from the average of 16 readings. This matters because
+  // mechanical neutral varies between modules and a 5 V module may output
+  // slightly different center voltages between axes.
   if (!joyCalibrated) {
-    joyNeutralX = x;
-    joyNeutralY = y;
+    long sumX = 0;
+    long sumY = 0;
+    for (int i = 0; i < 16; i++) {
+      sumX += analogRead(JOY_X_PIN);
+      sumY += analogRead(JOY_Y_PIN);
+      delay(5);
+    }
+    joyNeutralX = (int)(sumX / 16);
+    joyNeutralY = (int)(sumY / 16);
     joyCalibrated = true;
+    Serial.printf("Joystick calibrated: X=%d Y=%d\n", joyNeutralX, joyNeutralY);
   }
 
   char direction = 0;
   int xOffset = x - joyNeutralX;
   int yOffset = y - joyNeutralY;
 
-  if (abs(xOffset) >= JOY_DEADZONE && abs(xOffset) > abs(yOffset)) {
-    direction = xOffset > 0 ? 'R' : 'L';
-  } else if (abs(yOffset) >= JOY_DEADZONE && abs(yOffset) > abs(xOffset)) {
-    direction = yOffset > 0 ? 'D' : 'U';
+  if (DEBUG_LOG || now - lastJoyDebugAt >= 500) {
+    Serial.printf("JOY X=%d Y=%d offsets X=%d Y=%d\n", x, y, xOffset, yOffset);
+    lastJoyDebugAt = now;
+  }
+
+  if (activeAxis != 0) {
+    int activeOffset = (activeAxis == 'R' || activeAxis == 'L') ? xOffset : yOffset;
+    if (abs(activeOffset) > JOY_RETURN_DEADZONE) {
+      // Keep the active axis until the stick returns clearly to neutral.
+      direction = activeAxis;
+    }
+  }
+
+  if (direction == 0) {
+    if (abs(xOffset) >= JOY_DEADZONE && abs(xOffset) > abs(yOffset)) {
+      direction = xOffset > 0 ? 'R' : 'L';
+    } else if (abs(yOffset) >= JOY_DEADZONE && abs(yOffset) > abs(xOffset)) {
+      direction = yOffset > 0 ? 'D' : 'U';
+    }
   }
 
   if (direction != activeAxis) {
@@ -387,6 +414,7 @@ static void serviceJoystick() {
       int nextVolume = constrain(joystickVolume + (activeAxis == 'U' ? JOY_STEP_PCT : -JOY_STEP_PCT), 0, 100);
       if (nextVolume != joystickVolume) {
         joystickVolume = nextVolume;
+        joystickVolumeLockUntil = now + 1200;
         lastVolumeSent = joystickVolume;
         lastJoystickMove = now;
         showVolumeLabel(joystickVolume);
@@ -560,7 +588,8 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
 
         if (doc["type"] == "media_update"){
           volume = doc["volume"] | 0;
-          if (!volumeFinalPending) {
+          unsigned long now = millis();
+          if (activeAxis == 0 && now >= joystickVolumeLockUntil && !volumeFinalPending) {
             joystickVolume = constrain((int)volume, 0, 100);
             lastVolumeSent = joystickVolume;
           }

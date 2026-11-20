@@ -192,44 +192,16 @@ def _send_shuffle_key():
 
 
 async def playPause(media_controller=None):
-    if media_controller is not None:
-        session = media_controller.get_current_session()
-        if session is not None:
-            try:
-                controls = session.get_playback_info().controls
-                if controls.is_play_pause_toggle_enabled:
-                    await session.try_toggle_play_pause_async()
-                    return
-            except Exception:
-                pass  # fall through to media key
+    # Send Windows' physical play/pause media key directly. This is the
+    # most reliable route across Spotify, browsers, VLC, and Steam Music.
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(audio_pool, _send_media_key, VK_MEDIA_PLAY_PAUSE)
 
 async def nextTrack(media_controller=None):
-    if media_controller is not None:
-        session = media_controller.get_current_session()
-        if session is not None:
-            try:
-                controls = session.get_playback_info().controls
-                if controls.is_next_enabled:
-                    await session.try_skip_next_async()
-                    return
-            except Exception:
-                pass  # fall through to media key
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(audio_pool, _send_media_key, VK_MEDIA_NEXT_TRACK)
 
 async def previousTrack(media_controller=None):
-    if media_controller is not None:
-        session = media_controller.get_current_session()
-        if session is not None:
-            try:
-                controls = session.get_playback_info().controls
-                if controls.is_previous_enabled:
-                    await session.try_skip_previous_async()
-                    return
-            except Exception:
-                pass  # fall through to media key
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(audio_pool, _send_media_key, VK_MEDIA_PREV_TRACK)
 
