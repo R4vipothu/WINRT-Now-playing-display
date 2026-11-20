@@ -60,14 +60,14 @@
  *   VRY/Y  → GPIO32, analog vertical axis (ADC1)
  *   VRX/X  → GPIO35, analog horizontal axis (ADC1)
  *   SW     → GPIO27, momentary switch to GND (INPUT_PULLUP)
- *   VCC/+  → ESP32 VIN (5 V supply rail)
+ *   VCC/+  → ESP32 3V3 (do not use VIN/5 V: ADC pins are 3.3 V maximum)
  *   GND    → ESP32 GND
  *
  * Volume and direction controls:
- *   - Hold up for 220 ms, then repeat volume + JOY_STEP_PCT.
- *   - Hold down for 220 ms, then repeat volume - JOY_STEP_PCT.
+ *   - Hold up for 220 ms, then repeat a VolumeUp command.
+ *   - Hold down for 220 ms, then repeat a VolumeDown command.
  *   - Move RIGHT once for Next; move LEFT once for Previous.
- *   - The 1500/2500 ADC bands require deliberate axis displacement.
+ *   - A calibrated-center offset requires deliberate axis displacement.
  *   - Horizontal/vertical priority prevents diagonal accidental swipes.
  *   - Actions fire once, then reset after returning to neutral.
  *
@@ -86,8 +86,6 @@
 #define JOY_X_PIN 35          // joystick horizontal axis → GPIO35 (ADC1)
 #define JOY_Y_PIN 32          // joystick vertical axis → GPIO32 (ADC1)
 #define JOY_SW_PIN 27         // joystick click → GPIO27, input with INPUT_PULLUP
-#define JOY_STEP_PCT 2        // volume change per accepted joystick repeat
-#define VOLUME_SEND_MS 100    // legacy throttle kept for compatibility
 #define JOY_ACTION_OFFSET 900 // clear displacement from calibrated center
 #define JOY_RETURN_OFFSET 450 // hysteresis band for returning to neutral
 #define JOY_REPEAT_MS 160     // volume repeat delay while held away from center
@@ -137,6 +135,8 @@ lv_obj_t *placeHolderCover = nullptr;
 lv_obj_t *progressRing = nullptr;
 lv_obj_t *nameOfSong;
 lv_obj_t *nameOfArtist;
+lv_obj_t *playbackStatusIcon = nullptr;
+lv_obj_t *shuffleStatusIcon = nullptr;
 lv_obj_t *spindleHub;
 lv_obj_t *vinylDisc = nullptr; // circular clipping container that holds the art
 lv_obj_t *textStrip = nullptr; // semi-transparent strip behind the track info
@@ -259,11 +259,27 @@ void setup() {
   lv_obj_remove_flag(stripCore, LV_OBJ_FLAG_SCROLLABLE);
 
   nameOfSong = lv_label_create(lv_screen_active());
-  lv_obj_set_width(nameOfSong, TFT_HOR_RES - 16); // long titles scroll instead of overflowing
+  lv_obj_set_width(nameOfSong, TFT_HOR_RES - 42); // leave room for status icons
   lv_label_set_long_mode(nameOfSong, LV_LABEL_LONG_SCROLL_CIRCULAR);
   nameOfArtist = lv_label_create(lv_screen_active());
-  lv_obj_set_width(nameOfArtist, TFT_HOR_RES - 16);
+  lv_obj_set_width(nameOfArtist, TFT_HOR_RES - 42);
   lv_label_set_long_mode(nameOfArtist, LV_LABEL_LONG_SCROLL_CIRCULAR);
+
+  // Compact status icons at the right side of the track strip. ASCII symbols
+  // are used instead of font-dependent Unicode glyphs so they render on the
+  // configured LVGL font set.
+  playbackStatusIcon = lv_label_create(lv_screen_active());
+  lv_obj_set_width(playbackStatusIcon, 18);
+  lv_obj_set_style_text_color(playbackStatusIcon, lv_color_make(255, 120, 80), 0);
+  lv_obj_set_style_text_font(playbackStatusIcon, &lv_font_montserrat_14, 0);
+  lv_obj_set_pos(playbackStatusIcon, 216, 188);
+
+  shuffleStatusIcon = lv_label_create(lv_screen_active());
+  lv_obj_set_width(shuffleStatusIcon, 18);
+  lv_obj_set_style_text_color(shuffleStatusIcon, lv_color_make(185, 135, 255), 0);
+  lv_obj_set_style_text_font(shuffleStatusIcon, &lv_font_montserrat_10, 0);
+  lv_obj_set_pos(shuffleStatusIcon, 216, 208);
+  // lv_obj_add_flag(shuffleStatusIcon, LV_OBJ_FLAG_HIDDEN);
   
   playing = false; // assume there's no music
   volume = 0;
@@ -287,11 +303,6 @@ void setup() {
 // Axis values use a high neutral deadband and edge-triggered actions.
 // Click sends PlayPause; long click sends Shuffle.
 // ============================================================
-static int joystickVolume = 50;
-static int lastVolumeSent = 50;
-static unsigned long lastVolumeSend = 0;
-static unsigned long lastJoystickMove = 0;
-static unsigned long joystickVolumeLockUntil = 0;
 
 static int joyNeutralX = 2048;
 static int joyNeutralY = 2048;
@@ -310,11 +321,13 @@ static bool clickActionFired = false;
 
 static lv_obj_t *volumeLabel = nullptr; // stretch goal: tiny on-screen volume readout
 static unsigned long volumeLabelHideAt = 0;
+static int lastDisplayedVolume = -1;
+static unsigned long playbackIconFlashUntil = 0;
+static bool playbackFlashActive = false;
 
-static void sendVolume(int pct) { // {"action":"Volume","value":N} on the action channel
+static void sendVolumeStep(bool increase) {
   JsonDocument doc;
-  doc["action"] = "Volume";
-  doc["value"] = pct;
+  doc["action"] = increase ? "VolumeUp" : "VolumeDown";
 
   char msg[32];
   serializeJson(doc, msg, sizeof(msg));
@@ -343,8 +356,39 @@ static void showVolumeLabel(int pct) {
   volumeLabelHideAt = millis() + 1000; // hide ~1 s after the last change
 }
 
+static void flashPlaybackIcon(const char *symbol, unsigned long now) {
+  if (playbackStatusIcon == nullptr) return;
+  lv_label_set_text(playbackStatusIcon, symbol);
+  lv_obj_move_foreground(playbackStatusIcon);
+  playbackIconFlashUntil = now + 800;
+  playbackFlashActive = true;
+}
+
+static void updateStatusIcons(bool isPlaying, bool isShuffling) {
+  if (playbackStatusIcon != nullptr) {
+    lv_label_set_text(playbackStatusIcon, isPlaying ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
+    lv_obj_move_foreground(playbackStatusIcon);
+  }
+  if (shuffleStatusIcon != nullptr) {
+    lv_label_set_text(shuffleStatusIcon, LV_SYMBOL_SHUFFLE);
+    if (isShuffling) {
+      lv_obj_remove_flag(shuffleStatusIcon, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_move_foreground(shuffleStatusIcon);
+    } else {
+      lv_obj_add_flag(shuffleStatusIcon, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+}
+
 static void serviceJoystick() {
   unsigned long now = millis();
+
+  if (playbackFlashActive && (long)(now - playbackIconFlashUntil) >= 0) {
+    playbackFlashActive = false;
+    if (playbackStatusIcon != nullptr) {
+      lv_label_set_text(playbackStatusIcon, playing ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
+    }
+  }
 
   int x = analogRead(JOY_X_PIN);
   int y = analogRead(JOY_Y_PIN);
@@ -370,7 +414,7 @@ static void serviceJoystick() {
   int xOffset = x - joyNeutralX;
   int yOffset = y - joyNeutralY;
 
-  if (DEBUG_LOG || now - lastJoyDebugAt >= 500) {
+  if (DEBUG_LOG/* || now - lastJoyDebugAt >= 500*/) {
     Serial.printf("JOY X=%d Y=%d offsets X=%d Y=%d\n", x, y, xOffset, yOffset);
     lastJoyDebugAt = now;
   }
@@ -412,17 +456,8 @@ static void serviceJoystick() {
       nextVolumeRepeatAt = now;
     }
     if (axisActionFired && now >= nextVolumeRepeatAt) {
-      int nextVolume = constrain(joystickVolume + (activeAxis == 'U' ? JOY_STEP_PCT : -JOY_STEP_PCT), 0, 100);
-      if (nextVolume != joystickVolume) {
-        joystickVolume = nextVolume;
-        joystickVolumeLockUntil = now + 1200;
-        lastVolumeSent = joystickVolume;
-        lastJoystickMove = now;
-        showVolumeLabel(joystickVolume);
-        sendVolume(joystickVolume);
-        lastVolumeSend = now;
-        nextVolumeRepeatAt = now + JOY_REPEAT_MS;
-      }
+      sendVolumeStep(activeAxis == 'U');
+      nextVolumeRepeatAt = now + JOY_REPEAT_MS;
     }
   }
 
@@ -588,12 +623,14 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
 
         if (doc["type"] == "media_update"){
           volume = doc["volume"] | 0;
-          unsigned long now = millis();
-          if (activeAxis == 0 && now >= joystickVolumeLockUntil) {
-            joystickVolume = constrain((int)volume, 0, 100);
-            lastVolumeSent = joystickVolume;
+          int reportedVolume = constrain((int)volume, 0, 100);
+          if (reportedVolume != lastDisplayedVolume) {
+            lastDisplayedVolume = reportedVolume;
+            showVolumeLabel(reportedVolume);
           }
           playing = doc["playing"] | false;
+          bool shuffling = doc["shuffling"] | false;
+          updateStatusIcons(playing, shuffling);
           copyTrackField(title, sizeof(title), doc["title"] | "Unknown");
           copyTrackField(artist, sizeof(artist), doc["artist"] | "No Artist Available");
           currentPosition = doc["currentPos"] | 1;
@@ -678,6 +715,15 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
 }
 
 void sendAction(const char* action) { // use this to send messages to the Python server
+  unsigned long now = millis();
+  if (strcmp(action, "Next") == 0) {
+    flashPlaybackIcon(LV_SYMBOL_NEXT, now);
+  } else if (strcmp(action, "Previous") == 0) {
+    flashPlaybackIcon(LV_SYMBOL_PREV, now);
+  } else if (strcmp(action, "PlayPause") == 0) {
+    flashPlaybackIcon(playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY, now);
+  }
+
   JsonDocument doc;
   doc["action"] = action;
 
