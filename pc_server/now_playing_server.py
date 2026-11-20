@@ -1,3 +1,4 @@
+"""Windows media-server bridge for the ESP32 now-playing display."""
 
 import asyncio
 import struct
@@ -25,11 +26,6 @@ from PIL import Image
 #Volume functions
 audio_pool = ThreadPoolExecutor(max_workers=1)  # one thread, so COM state stays consistent
 
-UPDATE_MANAGER_TIME = 5 #constant used to check if the media has switched platforms
-
-# network tester bookkeeping (commented out with the SpeedTest handler)
-# startTime = 0
-# avgTimes = []
 
 backgroundColor = 0xFFFFFF
 
@@ -104,7 +100,8 @@ CHARACTER_REPLACEMENTS = {
 } # the font used with LVGL will not print certain characters
 
 # pycaw functions set up for async
-def _set_volume(level):  # level 0.0 to 1.0
+def _set_volume(level):
+    """Set the Windows master and active-session volume to 0.0–1.0."""
     from pycaw.pycaw import AudioUtilities
     # Update both the Windows master endpoint and the active session mixer
     # entries. Windows can display either one depending on the mixer view.
@@ -114,12 +111,14 @@ def _set_volume(level):  # level 0.0 to 1.0
         if session.SimpleAudioVolume is not None:
             session.SimpleAudioVolume.SetMasterVolume(level, None)
 
-def _set_mute(mute):  # sets all muted (true or false
+def _set_mute(mute):
+    """Set or clear mute on every active audio session."""
     from pycaw.pycaw import AudioUtilities
     for s in AudioUtilities.GetAllSessions():
         s.SimpleAudioVolume.SetMute(1 if mute else 0, None)
 
 def _get_volume():
+    """Return the Windows master volume as an integer percentage."""
     from pycaw.pycaw import AudioUtilities
 
     devices = AudioUtilities.GetSpeakers()
@@ -128,15 +127,18 @@ def _get_volume():
     return round(volume.GetMasterVolumeLevelScalar() * 100)
 
 # pycaw functions converted to async
-async def mute(isMuted):  # use me
+async def mute(isMuted):
+    """Toggle mute asynchronously with COM-safe audio-thread access."""
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(audio_pool, _set_mute, not isMuted)
 
-async def setVolume(level):  # use me
+async def setVolume(level):
+    """Set absolute volume asynchronously from a 0.0–1.0 level."""
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(audio_pool, _set_volume, level)
 
 async def getVolume():
+    """Get the current Windows master volume asynchronously."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(audio_pool, _get_volume)
 
@@ -212,20 +214,24 @@ def _send_shuffle_key():
 
 
 async def playPause(media_controller=None):
-    # Send Windows' physical play/pause media key directly. This is the
+    """Send the Windows media play/pause key."""
+    # Direct media keys are more reliable across apps than WinRT commands.
     # most reliable route across Spotify, browsers, VLC, and Steam Music.
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(audio_pool, _send_media_key, VK_MEDIA_PLAY_PAUSE)
 
 async def nextTrack(media_controller=None):
+    """Send the Windows next-track media key."""
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(audio_pool, _send_media_key, VK_MEDIA_NEXT_TRACK)
 
 async def previousTrack(media_controller=None):
+    """Send the Windows previous-track media key."""
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(audio_pool, _send_media_key, VK_MEDIA_PREV_TRACK)
 
 def fixName(name):
+    """Replace unsupported WinRT characters with LVGL-safe equivalents."""
     newName = ""
     for char in name:
         if char in CHARACTER_REPLACEMENTS:
@@ -238,6 +244,7 @@ def fixName(name):
 
 
 async def createThumbnail(thumbnail_ref):
+    """Download and resize the current session's album artwork."""
     stream = await asyncio.wait_for(thumbnail_ref.open_read_async(), timeout=5)
 
     reader = DataReader(stream)
@@ -267,6 +274,7 @@ async def createThumbnail(thumbnail_ref):
 
 
 async def sendThumbnail(websocket, filepath, output_path):
+    """Send RGB565 image specifications and binary pixels over WebSocket."""
     await setup_received.wait()
 
     CHUNK_SIZE = 8192
@@ -340,6 +348,7 @@ async def sendThumbnail(websocket, filepath, output_path):
 
 
 def getPositionOffset(timeLineProperties):
+    """Return elapsed time since the media timeline was last updated."""
     lastUpdate = timeLineProperties.last_updated_time
 
     currentTime = datetime.now(lastUpdate.tzinfo)
@@ -347,6 +356,7 @@ def getPositionOffset(timeLineProperties):
     return currentTime - lastUpdate
 
 async def waitForSession(mediaController):
+    """Wait until Windows exposes an active media session."""
     while True:
         session = mediaController.get_current_session()
         print("Waiting for session...")
@@ -355,14 +365,12 @@ async def waitForSession(mediaController):
 
         await asyncio.sleep(1)
 
-async def handle_client(websocket): #set up websocket
+async def handle_client(websocket):
+    """Handle ESP32 setup, media commands, and WebSocket status."""
     print("ESP32 connected!")
     received_setup = set()
-    #initialize the first manager and states
-    # ask windows for the controller
     mediaController = await GlobalSystemMediaTransportControlsSessionManager.request_async()
 
-    # ask if the media player is currently active
     session = await waitForSession(mediaController)
 
     try:
@@ -408,14 +416,6 @@ async def handle_client(websocket): #set up websocket
                                 # VLC/other apps may use app-specific shortcuts instead.
                                 await asyncio.get_running_loop().run_in_executor(audio_pool, _send_shuffle_key)
                                 print("Shuffle toggle")
-                            # --- network tester commented out ---
-                            # if data["action"] == "SpeedTest":
-                            #     global avgTimes
-                            #     diff = time.perf_counter() - startTime
-                            #     print("Time between there and back:", diff)
-                            #     if diff < 1000: #spikes to some unreasonable number at the beginning when initializing, skips it
-                            #         avgTimes += [diff]
-                            #         print("avg: ", sum(avgTimes) / len(avgTimes))
                         except (TypeError, ValueError) as err:
                             print("Bad action payload:", err)
                     if "BGColor" in data:
@@ -445,7 +445,8 @@ async def handle_client(websocket): #set up websocket
         print("ESP32 disconnected.")
 
 
-async def update_media(mediaController, session, websocket):  #main media grabber
+async def update_media(mediaController, session, websocket):
+    """Publish current track, volume, playback, shuffle, and artwork state."""
     global cached_volume, last_volume_command_at
     if session is not None: # first intialization
         # initial setup
@@ -469,7 +470,6 @@ async def update_media(mediaController, session, websocket):  #main media grabbe
 
 
         endTime = timeLineProperties.end_time  # gets total time
-        totalTimePaused = 0  # this is going to check if the user switched media players
         lastPosition = timeLineProperties.position
         while True:
             session = mediaController.get_current_session()
@@ -478,6 +478,7 @@ async def update_media(mediaController, session, websocket):  #main media grabbe
                 mediaProperties = await session.try_get_media_properties_async()
                 timeLineProperties = session.get_timeline_properties()
                 playbackProperties = session.get_playback_info()
+                isShuffling = playbackProperties.is_shuffle_active
                 if currentSong != mediaProperties.title:  # are we on the same song
                     endTime = timeLineProperties.end_time
                     currentSong = mediaProperties.title
@@ -500,20 +501,9 @@ async def update_media(mediaController, session, websocket):  #main media grabbe
                 if isPlaying:
                     position = position + offset
 
-                # if lastPosition == position: #old way of checking if the session changed
-                #     totalTimePaused = totalTimePaused + 1
-                # else:
-                #     totalTimePaused = 0
-                #
-                # if totalTimePaused >= UPDATE_MANAGER_TIME:
-                #     session = mediaController.get_current_session()
-                #     totalTimePaused = 0
-
                 posInSeconds = int(position.total_seconds())
                 endTimeInSeconds = int(endTime.total_seconds())
 
-                # global startTime      # network tester bookkeeping, commented out
-                # startTime = time.perf_counter()
                 response = {
                     "type": "media_update",
                     "volume": currentVol,
@@ -526,7 +516,6 @@ async def update_media(mediaController, session, websocket):  #main media grabbe
                     "endTime": endTimeInSeconds,
                 }
 
-                # print(response)
                 try:
                     await websocket.send(json.dumps(response))
                 except ConnectionClosed as e:
@@ -558,6 +547,7 @@ async def update_media(mediaController, session, websocket):  #main media grabbe
 
 
 async def main():
+    """Start the WebSocket server and keep it running until interrupted."""
     async with websockets.serve(handle_client,host = "0.0.0.0",port = 8765, max_size = 2 * 1024 * 1024): #handle web socket connections
         print("WebSocket server running on port 8765")
         print("Waiting for ESP32...")

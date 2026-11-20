@@ -270,16 +270,16 @@ void setup() {
   // configured LVGL font set.
   playbackStatusIcon = lv_label_create(lv_screen_active());
   lv_obj_set_width(playbackStatusIcon, 18);
-  lv_obj_set_style_text_color(playbackStatusIcon, lv_color_make(255, 255, 255), 0);
+  lv_obj_set_style_text_color(playbackStatusIcon, lv_color_make(255, 120, 80), 0);
   lv_obj_set_style_text_font(playbackStatusIcon, &lv_font_montserrat_14, 0);
   lv_obj_set_pos(playbackStatusIcon, 216, 188);
 
   shuffleStatusIcon = lv_label_create(lv_screen_active());
   lv_obj_set_width(shuffleStatusIcon, 18);
-  lv_obj_set_style_text_color(shuffleStatusIcon, lv_color_make(255, 190, 70), 0);
+  lv_obj_set_style_text_color(shuffleStatusIcon, lv_color_make(185, 135, 255), 0);
   lv_obj_set_style_text_font(shuffleStatusIcon, &lv_font_montserrat_10, 0);
   lv_obj_set_pos(shuffleStatusIcon, 216, 208);
-  lv_obj_add_flag(shuffleStatusIcon, LV_OBJ_FLAG_HIDDEN);
+  // lv_obj_add_flag(shuffleStatusIcon, LV_OBJ_FLAG_HIDDEN);
   
   playing = false; // assume there's no music
   volume = 0;
@@ -322,6 +322,8 @@ static bool clickActionFired = false;
 static lv_obj_t *volumeLabel = nullptr; // stretch goal: tiny on-screen volume readout
 static unsigned long volumeLabelHideAt = 0;
 static int lastDisplayedVolume = -1;
+static unsigned long playbackIconFlashUntil = 0;
+static bool playbackFlashActive = false;
 
 static void sendVolumeStep(bool increase) {
   JsonDocument doc;
@@ -354,13 +356,21 @@ static void showVolumeLabel(int pct) {
   volumeLabelHideAt = millis() + 1000; // hide ~1 s after the last change
 }
 
+static void flashPlaybackIcon(const char *symbol, unsigned long now) {
+  if (playbackStatusIcon == nullptr) return;
+  lv_label_set_text(playbackStatusIcon, symbol);
+  lv_obj_move_foreground(playbackStatusIcon);
+  playbackIconFlashUntil = now + 800;
+  playbackFlashActive = true;
+}
+
 static void updateStatusIcons(bool isPlaying, bool isShuffling) {
   if (playbackStatusIcon != nullptr) {
-    lv_label_set_text(playbackStatusIcon, isPlaying ? ">" : "||");
+    lv_label_set_text(playbackStatusIcon, isPlaying ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
     lv_obj_move_foreground(playbackStatusIcon);
   }
   if (shuffleStatusIcon != nullptr) {
-    lv_label_set_text(shuffleStatusIcon, "S");
+    lv_label_set_text(shuffleStatusIcon, LV_SYMBOL_SHUFFLE);
     if (isShuffling) {
       lv_obj_remove_flag(shuffleStatusIcon, LV_OBJ_FLAG_HIDDEN);
       lv_obj_move_foreground(shuffleStatusIcon);
@@ -372,6 +382,13 @@ static void updateStatusIcons(bool isPlaying, bool isShuffling) {
 
 static void serviceJoystick() {
   unsigned long now = millis();
+
+  if (playbackFlashActive && (long)(now - playbackIconFlashUntil) >= 0) {
+    playbackFlashActive = false;
+    if (playbackStatusIcon != nullptr) {
+      lv_label_set_text(playbackStatusIcon, playing ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
+    }
+  }
 
   int x = analogRead(JOY_X_PIN);
   int y = analogRead(JOY_Y_PIN);
@@ -397,7 +414,7 @@ static void serviceJoystick() {
   int xOffset = x - joyNeutralX;
   int yOffset = y - joyNeutralY;
 
-  if (DEBUG_LOG || now - lastJoyDebugAt >= 500) {
+  if (DEBUG_LOG/* || now - lastJoyDebugAt >= 500*/) {
     Serial.printf("JOY X=%d Y=%d offsets X=%d Y=%d\n", x, y, xOffset, yOffset);
     lastJoyDebugAt = now;
   }
@@ -698,6 +715,15 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
 }
 
 void sendAction(const char* action) { // use this to send messages to the Python server
+  unsigned long now = millis();
+  if (strcmp(action, "Next") == 0) {
+    flashPlaybackIcon(LV_SYMBOL_NEXT, now);
+  } else if (strcmp(action, "Previous") == 0) {
+    flashPlaybackIcon(LV_SYMBOL_PREV, now);
+  } else if (strcmp(action, "PlayPause") == 0) {
+    flashPlaybackIcon(playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY, now);
+  }
+
   JsonDocument doc;
   doc["action"] = action;
 

@@ -22,7 +22,7 @@ It works with **any app that reports to the Windows media session API**: Spotify
 └───────────────────────────┘                └────────────────────┘
 ```
 
-- **`media_update` (JSON, 1/sec):** title, artist, album, volume, playing state, position and duration in seconds.
+- **`media_update` (JSON, 1/sec):** title, artist, album, volume, playing state, shuffle state, position and duration in seconds.
 - **`imageSpecs` (JSON) + binary frames:** the server resizes the album art, converts it pixel-by-pixel to RGB565, and streams it in 8 KB chunks, which the ESP32 reassembles into the LVGL image buffer.
 - **Setup handshake:** on connect, the ESP32 reports its background color and display mode, so the server can blend the spinning-disc artwork correctly.
 - **Character cleanup:** Windows track titles contain characters the LVGL font can't render (curly quotes, em dashes, accented letters, symbols). The server maps them to safe ASCII equivalents before sending — see `CHARACTER_REPLACEMENTS` in the server.
@@ -31,6 +31,7 @@ It works with **any app that reports to the Windows media session API**: Spotify
 
 - ESP32 development board
 - 240×240 TFT display (TFT_eSPI-compatible), backlight on GPIO 21
+- Analog joystick module: VRX → GPIO35, VRY → GPIO32, SW → GPIO27, VCC → 3V3, GND → GND
 - Designed for a 240×240 TFT display supported by TFT_eSPI. Other TFT_eSPI displays may work with configuration and layout adjustments.
 
 ## Firmware setup (ESP32)
@@ -71,10 +72,18 @@ now-playing-display/
 - Switching between square (1:1) and non-square album art can misplace the cover offset on the display.
 - The WebSocket server has no authentication by design — it is meant to run on a trusted home LAN only. Don't expose port 8765 to the internet.
 
-## Implemented but not used
+## Joystick controls
 
-- Inputs to the script are included but not coded in the file. Wiring a button and adding a receive case in the Python file fixes this.
-- Pause/play states are sent back and forth but not displayed
+| Input | Action |
+|---|---|
+| Up | Increase Windows master volume |
+| Down | Decrease Windows master volume |
+| Right | Next track |
+| Left | Previous track |
+| Quick click | Play/pause |
+| 2-second hold | Toggle shuffle |
+
+Joystick X/Y axes use calibrated 12-bit ADC center and return hysteresis to prevent accidental diagonal or repeated actions. The LVGL play/pause and shuffle symbols are shown in the lower status area; an inactive shuffle state hides the shuffle symbol.
 
 ## License
 
