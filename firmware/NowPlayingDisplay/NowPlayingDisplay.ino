@@ -60,12 +60,12 @@
  *   VRY/Y  → GPIO35, analog vertical axis (ADC1)
  *   VRX/X  → GPIO34, analog horizontal axis (ADC1)
  *   SW     → GPIO27, momentary switch to GND (INPUT_PULLUP)
- *   VCC/+  → 3.3 V
+ *   VCC/+  → ESP32 VIN (5 V supply rail)
  *   GND    → ESP32 GND
  *
  * Volume and direction controls:
- *   - Hold UP for 220 ms, then repeat volume + JOY_STEP_PCT.
- *   - Hold DOWN for 220 ms, then repeat volume - JOY_STEP_PCT.
+ *   - Hold up for 220 ms, then repeat volume + JOY_STEP_PCT.
+ *   - Hold down for 220 ms, then repeat volume - JOY_STEP_PCT.
  *   - Move RIGHT once for Next; move LEFT once for Previous.
  *   - The 900-unit ADC deadzone requires a deliberate axis displacement.
  *   - Horizontal/vertical priority prevents diagonal accidental swipes.
@@ -74,8 +74,8 @@
  * Push-button gestures (SW / digital):
  *   Gesture          Action sent to PC   Detection
  *   ───────────────  ──────────────────   ──────────────────────
- *   Short click      PlayPause           Release within 900 ms
- *   Long click       Shuffle             Hold for 900 ms
+ *   Short click      PlayPause           Release within 2 seconds
+ *   Long click       Shuffle             Hold for 2 seconds
  *
  *   Debouncing: raw click changes require JOY_CLICK_DEBOUNCE_MS to settle.
  *
@@ -87,14 +87,13 @@
 #define JOY_Y_PIN 35          // joystick vertical axis → GPIO35 (ADC1)
 #define JOY_SW_PIN 27         // joystick click → GPIO27, input with INPUT_PULLUP
 #define JOY_STEP_PCT 2        // volume change per accepted joystick repeat
-#define VOLUME_SEND_MS 100    // throttle: at most one volume message per this many ms while turning
-#define VOLUME_SETTLE_MS 150  // send the final value this long after rotation stops
+#define VOLUME_SEND_MS 100    // legacy throttle kept for compatibility
 #define JOY_DEADZONE 900      // high threshold: must be clearly displaced from neutral
 #define JOY_RETURN_DEADZONE 500 // hysteresis: return halfway toward center before changing axis
 #define JOY_REPEAT_MS 160     // volume repeat delay while held away from center
 #define JOY_DIRECTION_MS 220  // minimum hold before an edge direction is accepted
 #define JOY_CLICK_DEBOUNCE_MS 50
-#define JOY_CLICK_LONG_MS 900
+#define JOY_CLICK_LONG_MS 2000
 
 #define DRAW_BUF_SIZE (TFT_HOR_RES * TFT_VER_RES / 24 * (LV_COLOR_DEPTH / 8))
 uint32_t draw_buf[DRAW_BUF_SIZE / 4];
@@ -292,7 +291,6 @@ static int joystickVolume = 50;
 static int lastVolumeSent = 50;
 static unsigned long lastVolumeSend = 0;
 static unsigned long lastJoystickMove = 0;
-static bool volumeFinalPending = false;
 static unsigned long joystickVolumeLockUntil = 0;
 
 static int joyNeutralX = 2048;
@@ -321,7 +319,7 @@ static void sendVolume(int pct) { // {"action":"Volume","value":N} on the action
   char msg[32];
   serializeJson(doc, msg, sizeof(msg));
   webSocket.sendTXT(msg);
-  Serial.println(msg);
+  Serial.printf("JOYSTICK SEND %s\n", msg);
 }
 
 static void showVolumeLabel(int pct) {
@@ -387,8 +385,12 @@ static void serviceJoystick() {
 
   if (direction == 0) {
     if (abs(xOffset) >= JOY_DEADZONE && abs(xOffset) > abs(yOffset)) {
+      // X-axis hardware polarity. Swap these two lines only if a joystick
+      // module labels or wire pairs in reverse.
       direction = xOffset > 0 ? 'R' : 'L';
     } else if (abs(yOffset) >= JOY_DEADZONE && abs(yOffset) > abs(xOffset)) {
+      // Y-axis hardware polarity. Keeping UP/DOWN explicit prevents
+      // diagonal motion and the previous down-to-Next misclassification.
       direction = yOffset > 0 ? 'D' : 'U';
     }
   }
@@ -420,13 +422,12 @@ static void serviceJoystick() {
         showVolumeLabel(joystickVolume);
         sendVolume(joystickVolume);
         lastVolumeSend = now;
-        volumeFinalPending = false;
         nextVolumeRepeatAt = now + JOY_REPEAT_MS;
       }
     }
   }
 
-  // ---- joystick click: 50 ms debounce; short = PlayPause, long = Shuffle ----
+  // ---- joystick click: 50 ms debounce; short = PlayPause, 2 s hold = Shuffle ----
   bool raw = digitalRead(JOY_SW_PIN) == LOW;
   if (raw != btnLastRaw) {
     btnLastRaw = raw;
@@ -589,7 +590,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
         if (doc["type"] == "media_update"){
           volume = doc["volume"] | 0;
           unsigned long now = millis();
-          if (activeAxis == 0 && now >= joystickVolumeLockUntil && !volumeFinalPending) {
+          if (activeAxis == 0 && now >= joystickVolumeLockUntil) {
             joystickVolume = constrain((int)volume, 0, 100);
             lastVolumeSent = joystickVolume;
           }
