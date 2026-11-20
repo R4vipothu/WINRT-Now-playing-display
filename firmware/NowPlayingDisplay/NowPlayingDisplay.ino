@@ -57,8 +57,8 @@
  * ----------------------------------------------------------------
  *
  * Physical pins:
- *   VRY/Y  → GPIO35, analog vertical axis (ADC1)
- *   VRX/X  → GPIO34, analog horizontal axis (ADC1)
+ *   VRY/Y  → GPIO32, analog vertical axis (ADC1)
+ *   VRX/X  → GPIO35, analog horizontal axis (ADC1)
  *   SW     → GPIO27, momentary switch to GND (INPUT_PULLUP)
  *   VCC/+  → ESP32 VIN (5 V supply rail)
  *   GND    → ESP32 GND
@@ -67,7 +67,7 @@
  *   - Hold up for 220 ms, then repeat volume + JOY_STEP_PCT.
  *   - Hold down for 220 ms, then repeat volume - JOY_STEP_PCT.
  *   - Move RIGHT once for Next; move LEFT once for Previous.
- *   - The 900-unit ADC deadzone requires a deliberate axis displacement.
+ *   - The 1500/2500 ADC bands require deliberate axis displacement.
  *   - Horizontal/vertical priority prevents diagonal accidental swipes.
  *   - Actions fire once, then reset after returning to neutral.
  *
@@ -83,17 +83,19 @@
  * LVGL tick and the WebSocket pump in loop() keep running.
  * ----------------------------------------------------------------
  */
-#define JOY_X_PIN 34          // joystick horizontal axis → GPIO34 (ADC1)
-#define JOY_Y_PIN 35          // joystick vertical axis → GPIO35 (ADC1)
+#define JOY_X_PIN 35          // joystick horizontal axis → GPIO35 (ADC1)
+#define JOY_Y_PIN 32          // joystick vertical axis → GPIO32 (ADC1)
 #define JOY_SW_PIN 27         // joystick click → GPIO27, input with INPUT_PULLUP
 #define JOY_STEP_PCT 2        // volume change per accepted joystick repeat
 #define VOLUME_SEND_MS 100    // legacy throttle kept for compatibility
-#define JOY_DEADZONE 900      // high threshold: must be clearly displaced from neutral
-#define JOY_RETURN_DEADZONE 500 // hysteresis: return halfway toward center before changing axis
+#define JOY_LOW_LIMIT 1500    // clear low side of a 12-bit axis
+#define JOY_HIGH_LIMIT 2500   // clear high side of a 12-bit axis
+#define JOY_RETURN_LOW 1800   // hysteresis band for returning to neutral
+#define JOY_RETURN_HIGH 2300
 #define JOY_REPEAT_MS 160     // volume repeat delay while held away from center
 #define JOY_DIRECTION_MS 220  // minimum hold before an edge direction is accepted
-#define JOY_CLICK_DEBOUNCE_MS 50
-#define JOY_CLICK_LONG_MS 2000
+#define JOY_CLICK_DEBOUNCE_MS 20
+#define JOY_CLICK_LONG_MS 500
 
 #define DRAW_BUF_SIZE (TFT_HOR_RES * TFT_VER_RES / 24 * (LV_COLOR_DEPTH / 8))
 uint32_t draw_buf[DRAW_BUF_SIZE / 4];
@@ -349,8 +351,8 @@ static void serviceJoystick() {
   int x = analogRead(JOY_X_PIN);
   int y = analogRead(JOY_Y_PIN);
 
-  // Establish center from the average of 16 readings. This matters because
-  // mechanical neutral varies between modules and a 5 V module may output
+  // Establish center from the average of 16 readings. Mechanical neutral
+  // varies between modules and a 5 V module may output
   // slightly different center voltages between axes.
   if (!joyCalibrated) {
     long sumX = 0;
@@ -375,23 +377,22 @@ static void serviceJoystick() {
     lastJoyDebugAt = now;
   }
 
+  // If an axis is active, hold it until both axes return to a neutral band.
   if (activeAxis != 0) {
-    int activeOffset = (activeAxis == 'R' || activeAxis == 'L') ? xOffset : yOffset;
-    if (abs(activeOffset) > JOY_RETURN_DEADZONE) {
-      // Keep the active axis until the stick returns clearly to neutral.
-      direction = activeAxis;
-    }
+    bool xNeutral = x >= JOY_RETURN_LOW && x <= JOY_RETURN_HIGH;
+    bool yNeutral = y >= JOY_RETURN_LOW && y <= JOY_RETURN_HIGH;
+    if (!xNeutral || !yNeutral) direction = activeAxis;
   }
 
   if (direction == 0) {
-    if (abs(xOffset) >= JOY_DEADZONE && abs(xOffset) > abs(yOffset)) {
-      // X-axis hardware polarity. Swap these two lines only if a joystick
-      // module labels or wire pairs in reverse.
-      direction = xOffset > 0 ? 'R' : 'L';
-    } else if (abs(yOffset) >= JOY_DEADZONE && abs(yOffset) > abs(xOffset)) {
-      // Y-axis hardware polarity. Keeping UP/DOWN explicit prevents
-      // diagonal motion and the previous down-to-Next misclassification.
-      direction = yOffset > 0 ? 'D' : 'U';
+    if (x < JOY_LOW_LIMIT) {
+      direction = 'L';
+    } else if (x > JOY_HIGH_LIMIT) {
+      direction = 'R';
+    } else if (y < JOY_LOW_LIMIT) {
+      direction = 'U';
+    } else if (y > JOY_HIGH_LIMIT) {
+      direction = 'D';
     }
   }
 

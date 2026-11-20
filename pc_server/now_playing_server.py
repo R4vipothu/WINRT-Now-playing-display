@@ -379,7 +379,7 @@ async def handle_client(websocket): #set up websocket
                                 # WinRT session playback controls are read-only in this
                                 # project. Spotify and some apps accept Ctrl+S for shuffle;
                                 # VLC/other apps may use app-specific shortcuts instead.
-                                await loop.run_in_executor(audio_pool, _send_shuffle_key)
+                                await asyncio.get_running_loop().run_in_executor(audio_pool, _send_shuffle_key)
                                 print("Shuffle toggle")
                             # --- network tester commented out ---
                             # if data["action"] == "SpeedTest":
