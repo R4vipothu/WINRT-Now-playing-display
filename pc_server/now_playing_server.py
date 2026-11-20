@@ -137,6 +137,8 @@ async def getVolume():
 VK_MEDIA_PLAY_PAUSE = 0xB3
 VK_MEDIA_NEXT_TRACK = 0xB0
 VK_MEDIA_PREV_TRACK = 0xB1
+VK_CONTROL = 0x11
+VK_S = 0x53
 
 def _send_media_key(vk):
     class KEYBDINPUT(ctypes.Structure):
@@ -158,6 +160,36 @@ def _send_media_key(vk):
         inputs[i].type = 1  # INPUT_KEYBOARD
         inputs[i].union.ki = KEYBDINPUT(vk, 0, flags, 0, ctypes.pointer(extra))
     ctypes.windll.user32.SendInput(2, inputs, ctypes.sizeof(INPUT))
+
+
+def _send_shuffle_key():
+    """Send Ctrl+S for apps that implement the common shuffle shortcut."""
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", ctypes.c_ushort),
+                    ("wScan", ctypes.c_ushort),
+                    ("dwFlags", ctypes.c_ulong),
+                    ("time", ctypes.c_ulong),
+                    ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+    class INPUTunion(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT), ("padding", ctypes.c_ubyte * 32)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_ulong), ("union", INPUTunion)]
+
+    extra = ctypes.c_ulong(0)
+    inputs = (INPUT * 4)()
+    key_events = (
+        (VK_CONTROL, 0),
+        (VK_S, 0),
+        (VK_S, 2),
+        (VK_CONTROL, 2),
+    )
+    for i, (vk, flags) in enumerate(key_events):
+        inputs[i].type = 1
+        inputs[i].union.ki = KEYBDINPUT(vk, 0, flags, 0, ctypes.pointer(extra))
+    ctypes.windll.user32.SendInput(4, inputs, ctypes.sizeof(INPUT))
+
 
 async def playPause(media_controller=None):
     if media_controller is not None:
@@ -371,6 +403,12 @@ async def handle_client(websocket): #set up websocket
                             elif data["action"] == "Previous":
                                 await previousTrack(mediaController)
                                 print("Previous")
+                            elif data["action"] == "Shuffle":
+                                # WinRT session playback controls are read-only in this
+                                # project. Spotify and some apps accept Ctrl+S for shuffle;
+                                # VLC/other apps may use app-specific shortcuts instead.
+                                await loop.run_in_executor(audio_pool, _send_shuffle_key)
+                                print("Shuffle toggle")
                             # --- network tester commented out ---
                             # if data["action"] == "SpeedTest":
                             #     global avgTimes

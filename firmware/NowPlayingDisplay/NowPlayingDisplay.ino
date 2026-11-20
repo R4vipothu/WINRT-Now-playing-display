@@ -53,55 +53,47 @@
 
 /*
  * ----------------------------------------------------------------
- * Rotary encoder with push switch (e.g. KY-040 module)
+ * Analog joystick with push switch
  * ----------------------------------------------------------------
  *
  * Physical pins:
- *   CLK → GPIO34, digital quadrature channel A
- *   DT  → GPIO26, digital quadrature channel B
- *   SW  → GPIO27, momentary switch to GND (INPUT_PULLUP)
- *   +   → 3.3 V
- *   GND → ESP32 GND
+ *   VRY/Y  → GPIO35, analog vertical axis (ADC1)
+ *   VRX/X  → GPIO34, analog horizontal axis (ADC1)
+ *   SW     → GPIO27, momentary switch to GND (INPUT_PULLUP)
+ *   VCC/+  → 3.3 V
+ *   GND    → ESP32 GND
  *
- * Volume control (CLK / DT quadrature):
- *   - Both digital channels are read on every CHANGE interrupt.
- *   - The Gray-code sequence is decoded with an 16-entry transition
- *     table. Each accepted detent changes volume by ENC_STEP_PCT.
- *   - Volume messages are throttled to VOLUME_SEND_MS while turning.
- *     VOLUME_SETTLE_MS after the final detent sends the final value.
- *   - On-screen, a "Vol XX%" label pops up and auto-hides ~1 s.
+ * Volume and direction controls:
+ *   - Hold UP for 220 ms, then repeat volume + JOY_STEP_PCT.
+ *   - Hold DOWN for 220 ms, then repeat volume - JOY_STEP_PCT.
+ *   - Move RIGHT once for Next; move LEFT once for Previous.
+ *   - The 900-unit ADC deadzone requires a deliberate axis displacement.
+ *   - Horizontal/vertical priority prevents diagonal accidental swipes.
+ *   - Actions fire once, then reset after returning to neutral.
  *
  * Push-button gestures (SW / digital):
  *   Gesture          Action sent to PC   Detection
  *   ───────────────  ──────────────────   ──────────────────────
- *   Short press      PlayPause            One tap with no second
- *                                         tap within GESTURE_WINDOW_MS.
- *   Double press     Next                 Two taps within
- *                                         GESTURE_WINDOW_MS of each
- *                                         other.
- *   Long press       Previous             Held longer than
- *                                         LONGPRESS_MS. Fires once
- *                                         at the threshold, not on
- *                                         release. Also cancels any
- *                                         pending single-tap.
+ *   Short click      PlayPause           Release within 900 ms
+ *   Long click       Shuffle             Hold for 900 ms
  *
- *   Debouncing: state changes are ignored for BTN_DEBOUNCE_MS after
- *   the raw pin value flips. This prevents mechanical contact bounce
- *   from registering as multiple presses.
+ *   Debouncing: raw click changes require JOY_CLICK_DEBOUNCE_MS to settle.
  *
  * None of this code blocks; everything is millis()-based so the
  * LVGL tick and the WebSocket pump in loop() keep running.
  * ----------------------------------------------------------------
  */
-#define ENC_CLK_PIN 34        // encoder CLK → GPIO34, digital input (not ADC)
-#define ENC_DT_PIN 26         // encoder DT  → GPIO26, digital input
-#define BTN_PIN 27            // encoder SW  → GPIO27, input with INPUT_PULLUP
-#define ENC_STEP_PCT 2        // volume change per accepted encoder detent
+#define JOY_X_PIN 34          // joystick horizontal axis → GPIO34 (ADC1)
+#define JOY_Y_PIN 35          // joystick vertical axis → GPIO35 (ADC1)
+#define JOY_SW_PIN 27         // joystick click → GPIO27, input with INPUT_PULLUP
+#define JOY_STEP_PCT 2        // volume change per accepted joystick repeat
 #define VOLUME_SEND_MS 100    // throttle: at most one volume message per this many ms while turning
 #define VOLUME_SETTLE_MS 150  // send the final value this long after rotation stops
-#define BTN_DEBOUNCE_MS 40    // ignore pin-state flips shorter than this (contact bounce filter)
-#define GESTURE_WINDOW_MS 500 // max gap between two taps that counts as a double press
-#define LONGPRESS_MS 600      // hold longer than this = "Previous" track
+#define JOY_DEADZONE 900      // high threshold: must be clearly displaced from neutral
+#define JOY_REPEAT_MS 160     // volume repeat delay while held away from center
+#define JOY_DIRECTION_MS 220  // minimum hold before an edge direction is accepted
+#define JOY_CLICK_DEBOUNCE_MS 50
+#define JOY_CLICK_LONG_MS 900
 
 #define DRAW_BUF_SIZE (TFT_HOR_RES * TFT_VER_RES / 24 * (LV_COLOR_DEPTH / 8))
 uint32_t draw_buf[DRAW_BUF_SIZE / 4];
@@ -200,12 +192,9 @@ void setup() {
   pinMode(21, OUTPUT);
   digitalWrite(21, HIGH);
 
-  // Rotary encoder inputs (see the detailed hardware docs above the #defines)
-  pinMode(ENC_CLK_PIN, INPUT_PULLUP); // CLK → GPIO34, quadrature channel A
-  pinMode(ENC_DT_PIN, INPUT_PULLUP);  // DT  → GPIO26, quadrature channel B
-  pinMode(BTN_PIN, INPUT_PULLUP);     // SW  → GPIO27; switch shorts to GND on press
-  attachInterrupt(digitalPinToInterrupt(ENC_CLK_PIN), handleEncoderInterrupt, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENC_DT_PIN), handleEncoderInterrupt, CHANGE);
+  // Analog joystick inputs (see the detailed hardware docs above the #defines)
+  pinMode(JOY_SW_PIN, INPUT_PULLUP); // SW shorts to GND when pressed
+  analogReadResolution(12);
 
   //display configuration
   Serial.println("Starting intialization");
@@ -294,44 +283,29 @@ void setup() {
 }
 
 // ============================================================
-// Rotary encoder service: CLK/DT → volume, SW → gestures.
-// CLK and DT are decoded digitally as quadrature. Each accepted
-// detent changes volume by ENC_STEP_PCT; no ADC jitter or library is needed.
-// Everything is millis()-based; never blocks LVGL or the WebSocket pump.
+// Analog joystick service: X/Y axis + SW button.
+// Axis values use a high neutral deadband and edge-triggered actions.
+// Click sends PlayPause; long click sends Shuffle.
 // ============================================================
-static int encoderVolume = 50;          // device volume before the server reports its actual level
+static int joystickVolume = 50;
 static int lastVolumeSent = 50;
 static unsigned long lastVolumeSend = 0;
-static unsigned long lastEncoderMove = 0;
+static unsigned long lastJoystickMove = 0;
 static bool volumeFinalPending = false;
 
-static uint8_t encoderLastState = 0;
-volatile static int8_t encoderDelta = 0;
+static int joyNeutralX = 2048;
+static int joyNeutralY = 2048;
+static bool joyCalibrated = false;
+static char activeAxis = 0;
+static unsigned long axisStartAt = 0;
+static unsigned long nextVolumeRepeatAt = 0;
+static bool axisActionFired = false;
 
-void IRAM_ATTR handleEncoderInterrupt() {
-  uint8_t state = (digitalRead(ENC_CLK_PIN) << 1) | digitalRead(ENC_DT_PIN);
-  uint8_t transition = (encoderLastState << 2) | state;
-
-  // Standard 16-entry Gray-code decoder. Add only complete valid transitions;
-  // bounce and invalid mid-state combinations contribute nothing.
-  static const int8_t encoderTable[16] = {
-     0, -1,  1,  0,
-     1,  0,  0, -1,
-    -1,  0,  0,  1,
-     0,  1, -1,  0
-  };
-  encoderDelta += encoderTable[transition];
-  encoderLastState = state;
-}
-
-// --- push-button (SW pin) state machine ---
-static bool btnLastRaw = false;          // last raw digitalRead value (before debounce)
-static bool btnPressed = false;          // debounced state: true = button is held down
-static unsigned long btnChangeAt = 0;    // millis() when the raw value last changed
-static unsigned long pressStartAt = 0;   // millis() when the current press began
-static bool longPressFired = false;      // has the long-press action already fired this hold?
-static bool waitingSecondTap = false;    // first tap seen; waiting to see if a second follows
-static unsigned long windowStartAt = 0;  // millis() when the double-tap window opened
+static bool btnLastRaw = false;
+static bool btnPressed = false;
+static unsigned long btnChangeAt = 0;
+static unsigned long pressStartAt = 0;
+static bool clickActionFired = false;
 
 static lv_obj_t *volumeLabel = nullptr; // stretch goal: tiny on-screen volume readout
 static unsigned long volumeLabelHideAt = 0;
@@ -368,71 +342,80 @@ static void showVolumeLabel(int pct) {
   volumeLabelHideAt = millis() + 1000; // hide ~1 s after the last change
 }
 
-static void serviceKnob() {
+static void serviceJoystick() {
   unsigned long now = millis();
 
-  // ---- VOLUME (CLK/DT quadrature) ----
-  noInterrupts();
-  int8_t delta = encoderDelta;
-  encoderDelta = 0;
-  interrupts();
+  int x = analogRead(JOY_X_PIN);
+  int y = analogRead(JOY_Y_PIN);
 
-  if (delta != 0) {
-    int nextVolume = constrain(encoderVolume + (delta * ENC_STEP_PCT), 0, 100);
-    if (nextVolume != encoderVolume) {
-      encoderVolume = nextVolume;
-      lastVolumeSent = encoderVolume;
-      lastEncoderMove = now;
-      showVolumeLabel(encoderVolume);
+  // First read establishes mechanical center. 900-unit deadzone prevents
+  // half-swipes, noisy center readings, and diagonal false starts.
+  if (!joyCalibrated) {
+    joyNeutralX = x;
+    joyNeutralY = y;
+    joyCalibrated = true;
+  }
 
-      if (now - lastVolumeSend >= VOLUME_SEND_MS) {
-        sendVolume(encoderVolume);
+  char direction = 0;
+  int xOffset = x - joyNeutralX;
+  int yOffset = y - joyNeutralY;
+
+  if (abs(xOffset) >= JOY_DEADZONE && abs(xOffset) > abs(yOffset)) {
+    direction = xOffset > 0 ? 'R' : 'L';
+  } else if (abs(yOffset) >= JOY_DEADZONE && abs(yOffset) > abs(xOffset)) {
+    direction = yOffset > 0 ? 'D' : 'U';
+  }
+
+  if (direction != activeAxis) {
+    activeAxis = direction;
+    axisActionFired = false;
+    axisStartAt = now;
+    nextVolumeRepeatAt = now;
+
+    if (direction == 'R' || direction == 'L') {
+      axisActionFired = true;
+      sendAction(direction == 'R' ? "Next" : "Previous");
+    }
+  }
+
+  if (activeAxis == 'U' || activeAxis == 'D') {
+    if (now - axisStartAt >= JOY_DIRECTION_MS && !axisActionFired) {
+      axisActionFired = true;
+      nextVolumeRepeatAt = now;
+    }
+    if (axisActionFired && now >= nextVolumeRepeatAt) {
+      int nextVolume = constrain(joystickVolume + (activeAxis == 'U' ? JOY_STEP_PCT : -JOY_STEP_PCT), 0, 100);
+      if (nextVolume != joystickVolume) {
+        joystickVolume = nextVolume;
+        lastVolumeSent = joystickVolume;
+        lastJoystickMove = now;
+        showVolumeLabel(joystickVolume);
+        sendVolume(joystickVolume);
         lastVolumeSend = now;
         volumeFinalPending = false;
-      } else {
-        volumeFinalPending = true;
+        nextVolumeRepeatAt = now + JOY_REPEAT_MS;
       }
     }
   }
-  if (volumeFinalPending && now - lastEncoderMove >= VOLUME_SETTLE_MS) {
-    sendVolume(encoderVolume);
-    lastVolumeSend = now;
-    volumeFinalPending = false;
-  }
 
-  // ---- PUSH BUTTON (SW pin): debounce → tap / double-tap / long-press ----
-  bool raw = digitalRead(BTN_PIN) == LOW; // INPUT_PULLUP: idle HIGH, pressed LOW
+  // ---- joystick click: 50 ms debounce; short = PlayPause, long = Shuffle ----
+  bool raw = digitalRead(JOY_SW_PIN) == LOW;
   if (raw != btnLastRaw) {
     btnLastRaw = raw;
     btnChangeAt = now;
   }
-  if (raw != btnPressed && now - btnChangeAt >= BTN_DEBOUNCE_MS) {
+  if (raw != btnPressed && now - btnChangeAt >= JOY_CLICK_DEBOUNCE_MS) {
     btnPressed = raw;
-    if (btnPressed) { // press starts: long-press window opens
+    if (btnPressed) {
       pressStartAt = now;
-      longPressFired = false;
-    }
-    else if (!longPressFired) { // released before the long-press threshold
-      if (waitingSecondTap && now - windowStartAt <= GESTURE_WINDOW_MS) {
-        sendAction("Next"); // double press: two taps inside the window
-        waitingSecondTap = false;
-      }
-      else {
-        waitingSecondTap = true; // could still become a double press - hold on
-        windowStartAt = now;
-      }
-    }
-  }
-  if (btnPressed && !longPressFired && now - pressStartAt >= LONGPRESS_MS) {
-    longPressFired = true; // fires once at the threshold, not on release
-    waitingSecondTap = false; // a hold also cancels any pending single tap
-    sendAction("Previous");
-  }
-  if (waitingSecondTap && now - windowStartAt > GESTURE_WINDOW_MS) {
-    if (!btnPressed) { // nothing came: it was a plain short press
+      clickActionFired = false;
+    } else if (!clickActionFired) {
       sendAction("PlayPause");
     }
-    waitingSecondTap = false; // if a press is still held, the long-press path owns it
+  }
+  if (btnPressed && !clickActionFired && now - pressStartAt >= JOY_CLICK_LONG_MS) {
+    clickActionFired = true;
+    sendAction("Shuffle");
   }
 
   // ---- volume label auto-hide ----
@@ -457,7 +440,7 @@ static void applyImageGeometry(){ // re-fit the cover when the art size changes;
 
 void loop() {
   webSocket.loop();
-  serviceKnob();
+  serviceJoystick();
   if (!haveTrackInfo) { // no real media_update yet: blank record + placeholder text
     if (!unknownStateShown) {
       setUnknownLabels();
@@ -578,8 +561,8 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
         if (doc["type"] == "media_update"){
           volume = doc["volume"] | 0;
           if (!volumeFinalPending) {
-            encoderVolume = constrain((int)volume, 0, 100);
-            lastVolumeSent = encoderVolume;
+            joystickVolume = constrain((int)volume, 0, 100);
+            lastVolumeSent = joystickVolume;
           }
           playing = doc["playing"] | false;
           copyTrackField(title, sizeof(title), doc["title"] | "Unknown");
@@ -665,7 +648,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
   }
 }
 
-void sendAction(const char* action) { // use this to send messages to the python
+void sendAction(const char* action) { // use this to send messages to the Python server
   JsonDocument doc;
   doc["action"] = action;
 
