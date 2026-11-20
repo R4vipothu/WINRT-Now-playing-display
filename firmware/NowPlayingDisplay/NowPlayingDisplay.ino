@@ -99,7 +99,7 @@
 #define ENC_STEP_PCT 2        // volume change per accepted encoder detent
 #define VOLUME_SEND_MS 100    // throttle: at most one volume message per this many ms while turning
 #define VOLUME_SETTLE_MS 150  // send the final value this long after rotation stops
-#define BTN_DEBOUNCE_MS 40    // ignore pin-state flips shorter than this (contact bounce filter)
+#define BTN_DEBOUNCE_MS 50    // ignore pin-state flips shorter than this (contact bounce filter)
 #define GESTURE_WINDOW_MS 500 // max gap between two taps that counts as a double press
 #define LONGPRESS_MS 600      // hold longer than this = "Previous" track
 
@@ -316,23 +316,46 @@ static unsigned long lastEncoderMove = 0;
 static bool volumeFinalPending = false;
 
 static uint8_t encoderLastState = 0;
-volatile static int8_t encoderDelta = 0;
+volatile static int32_t encoderDelta = 0;  // int32: prevents overflow on fast spins
+
+// Full-step Gray-code decoder for the KY-040. Counts exactly once per
+// mechanical detent (every 4 edges) instead of on every half-step.
+// States: 0=START, 1=CW_step1, 2=CW_step2, 3=CCW_step1, 4=CCW_step2.
+// Outputs: +1 when a full clockwise detent completes, -1 for CCW.
+#define DIR_NONE 0
+#define DIR_CW   1
+#define DIR_CCW  2
+#define FS_START 0
+#define FS_CW1   1
+#define FS_CW2   2
+#define FS_CCW1  3
+#define FS_CCW2  4
+
+static volatile uint8_t fsState = FS_START;
 
 void IRAM_ATTR handleEncoderInterrupt() {
-  // DT in the high bit so clockwise → positive delta (swap if your knob is reversed)
-  uint8_t state = (digitalRead(ENC_DT_PIN) << 1) | digitalRead(ENC_CLK_PIN);
-  uint8_t transition = (encoderLastState << 2) | state;
+  uint8_t pinState = (digitalRead(ENC_DT_PIN) << 1) | digitalRead(ENC_CLK_PIN);
 
-  // Standard 16-entry Gray-code decoder. Add only complete valid transitions;
-  // bounce and invalid mid-state combinations contribute nothing.
-  static const int8_t encoderTable[16] = {
-     0, -1,  1,  0,
-     1,  0,  0, -1,
-    -1,  0,  0,  1,
-     0,  1, -1,  0
+  // State-machine transition table: [current_state][pin_reading] → next_state
+  // Encodes the full quadrature cycle; only the final transition of a
+  // complete detent produces a count. Bounces and partial turns return to START.
+  static const uint8_t fullStepTable[5][4] = {
+    // pin reading:  00        01        10        11
+    /* START  */ { FS_START, FS_CCW1, FS_CW1,  FS_START },
+    /* CW1    */ { FS_START, FS_START, FS_CW1,  FS_CW2  },
+    /* CW2    */ { FS_CW2,  FS_START, FS_CW1,  FS_START },  // 00 completes CW
+    /* CCW1   */ { FS_START, FS_CCW1, FS_START, FS_CCW2 },
+    /* CCW2   */ { FS_CCW2, FS_CCW1, FS_START, FS_START },  // 00 completes CCW
   };
-  encoderDelta += encoderTable[transition];
-  encoderLastState = state;
+
+  uint8_t newState = fullStepTable[fsState][pinState];
+
+  // A detent is complete when the state loops back to itself in CW2/CCW2
+  // while the pins read 00 (the detent rest position for the KY-040).
+  if (newState == FS_CW2  && pinState == 0) { encoderDelta++;  newState = FS_START; }
+  if (newState == FS_CCW2 && pinState == 0) { encoderDelta--;  newState = FS_START; }
+
+  fsState = newState;
 }
 
 // --- push-button (SW pin) state machine ---
@@ -384,7 +407,7 @@ static void serviceKnob() {
 
   // ---- VOLUME (CLK/DT quadrature) ----
   noInterrupts();
-  int8_t delta = encoderDelta;
+  int32_t delta = encoderDelta;
   encoderDelta = 0;
   interrupts();
 
@@ -412,6 +435,15 @@ static void serviceKnob() {
   }
 
   // ---- PUSH BUTTON (SW pin): debounce → tap / double-tap / long-press ----
+  //
+  // Detection strategy:
+  //   • Double-tap triggers on the second PRESS (not release), so the user
+  //     only needs to click twice quickly — no need to fully release before
+  //     the window expires.
+  //   • Single tap (PlayPause) fires when the gesture window expires without
+  //     a second press.
+  //   • Long press fires at the LONGPRESS_MS threshold while still held.
+  //
   bool raw = digitalRead(BTN_PIN) == LOW; // INPUT_PULLUP: idle HIGH, pressed LOW
   if (raw != btnLastRaw) {
     btnLastRaw = raw;
@@ -419,31 +451,32 @@ static void serviceKnob() {
   }
   if (raw != btnPressed && now - btnChangeAt >= BTN_DEBOUNCE_MS) {
     btnPressed = raw;
-    if (btnPressed) { // press starts: long-press window opens
+    if (btnPressed) { // ---- press edge ----
       pressStartAt = now;
       longPressFired = false;
-    }
-    else if (!longPressFired) { // released before the long-press threshold
       if (waitingSecondTap && now - windowStartAt <= GESTURE_WINDOW_MS) {
-        sendAction("Next"); // double press: two taps inside the window
+        // Second press arrived inside the window → Next track
+        sendAction("Next");
         waitingSecondTap = false;
       }
-      else {
-        waitingSecondTap = true; // could still become a double press - hold on
+    }
+    else if (!longPressFired) { // ---- release edge (before long-press) ----
+      // Start the double-tap window on the first release
+      if (!waitingSecondTap) {
+        waitingSecondTap = true;
         windowStartAt = now;
       }
     }
   }
   if (btnPressed && !longPressFired && now - pressStartAt >= LONGPRESS_MS) {
-    longPressFired = true; // fires once at the threshold, not on release
-    waitingSecondTap = false; // a hold also cancels any pending single tap
+    longPressFired = true;
+    waitingSecondTap = false;
     sendAction("Previous");
   }
   if (waitingSecondTap && now - windowStartAt > GESTURE_WINDOW_MS) {
-    if (!btnPressed) { // nothing came: it was a plain short press
-      sendAction("PlayPause");
-    }
-    waitingSecondTap = false; // if a press is still held, the long-press path owns it
+    // Window expired with no second press → single tap = PlayPause
+    sendAction("PlayPause");
+    waitingSecondTap = false;
   }
 
   // ---- volume label auto-hide ----
