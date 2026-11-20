@@ -88,14 +88,12 @@
 #define JOY_SW_PIN 27         // joystick click → GPIO27, input with INPUT_PULLUP
 #define JOY_STEP_PCT 2        // volume change per accepted joystick repeat
 #define VOLUME_SEND_MS 100    // legacy throttle kept for compatibility
-#define JOY_LOW_LIMIT 1500    // clear low side of a 12-bit axis
-#define JOY_HIGH_LIMIT 2500   // clear high side of a 12-bit axis
-#define JOY_RETURN_LOW 1800   // hysteresis band for returning to neutral
-#define JOY_RETURN_HIGH 2300
+#define JOY_ACTION_OFFSET 900 // clear displacement from calibrated center
+#define JOY_RETURN_OFFSET 450 // hysteresis band for returning to neutral
 #define JOY_REPEAT_MS 160     // volume repeat delay while held away from center
 #define JOY_DIRECTION_MS 220  // minimum hold before an edge direction is accepted
 #define JOY_CLICK_DEBOUNCE_MS 20
-#define JOY_CLICK_LONG_MS 500
+#define JOY_CLICK_LONG_MS 2000
 
 #define DRAW_BUF_SIZE (TFT_HOR_RES * TFT_VER_RES / 24 * (LV_COLOR_DEPTH / 8))
 uint32_t draw_buf[DRAW_BUF_SIZE / 4];
@@ -379,19 +377,19 @@ static void serviceJoystick() {
 
   // If an axis is active, hold it until both axes return to a neutral band.
   if (activeAxis != 0) {
-    bool xNeutral = x >= JOY_RETURN_LOW && x <= JOY_RETURN_HIGH;
-    bool yNeutral = y >= JOY_RETURN_LOW && y <= JOY_RETURN_HIGH;
+    bool xNeutral = abs(x - joyNeutralX) <= JOY_RETURN_OFFSET;
+    bool yNeutral = abs(y - joyNeutralY) <= JOY_RETURN_OFFSET;
     if (!xNeutral || !yNeutral) direction = activeAxis;
   }
 
   if (direction == 0) {
-    if (x < JOY_LOW_LIMIT) {
+    if (x <= joyNeutralX - JOY_ACTION_OFFSET) {
       direction = 'L';
-    } else if (x > JOY_HIGH_LIMIT) {
+    } else if (x >= joyNeutralX + JOY_ACTION_OFFSET) {
       direction = 'R';
-    } else if (y < JOY_LOW_LIMIT) {
+    } else if (y <= joyNeutralY - JOY_ACTION_OFFSET) {
       direction = 'U';
-    } else if (y > JOY_HIGH_LIMIT) {
+    } else if (y >= joyNeutralY + JOY_ACTION_OFFSET) {
       direction = 'D';
     }
   }
