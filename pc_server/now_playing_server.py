@@ -38,6 +38,8 @@ setup_received = asyncio.Event()
 # Cached master volume used by the joystick's relative VolumeUp/VolumeDown
 # commands. The media-update loop refreshes this from Windows periodically.
 cached_volume = 50
+last_volume_command_at = 0.0
+VOLUME_COMMAND_HOLD_SECONDS = 2.0
 
 DISPLAYTYPE = -1 # 1 is standard, 2 is album disk
 
@@ -104,8 +106,11 @@ CHARACTER_REPLACEMENTS = {
 # pycaw functions set up for async
 def _set_volume(level):  # level 0.0 to 1.0
     from pycaw.pycaw import AudioUtilities
-    for s in AudioUtilities.GetAllSessions():
-        s.SimpleAudioVolume.SetMasterVolume(level, None)
+    # Read and write the same endpoint. Previously writes went to each
+    # session while reads came from the endpoint, so the cache immediately
+    # jumped back to an unrelated/stale value.
+    devices = AudioUtilities.GetSpeakers()
+    devices.EndpointVolume.SetMasterVolumeLevelScalar(level, None)
 
 def _set_mute(mute):  # sets all muted (true or false
     from pycaw.pycaw import AudioUtilities
@@ -136,9 +141,10 @@ async def getVolume():
 
 async def changeVolume(delta):
     """Apply a small relative volume change without an ESP32 feedback loop."""
-    global cached_volume
+    global cached_volume, last_volume_command_at
     cached_volume = max(0, min(100, cached_volume + delta))
     await setVolume(cached_volume / 100.0)
+    last_volume_command_at = time.monotonic()
     print("Volume ->", cached_volume)
 
 # Playback control: WinRT SMTC sessions are read-only (you can watch them,
@@ -375,8 +381,11 @@ async def handle_client(websocket): #set up websocket
                         try:
                             if data["action"] == "Volume":
                                 # knob reports 0-100, pycaw wants 0.0-1.0
+                                global cached_volume, last_volume_command_at
                                 level = max(0.0, min(1.0, float(data.get("value", 0)) / 100.0))
                                 await setVolume(level)
+                                cached_volume = round(level * 100)
+                                last_volume_command_at = time.monotonic()
                                 print("Volume ->", round(level * 100))
                             elif data["action"] == "VolumeUp":
                                 await changeVolume(2)
@@ -435,6 +444,7 @@ async def handle_client(websocket): #set up websocket
 
 
 async def update_media(mediaController, session, websocket):  #main media grabber
+    global cached_volume, last_volume_command_at
     if session is not None: # first intialization
         # initial setup
         mediaProperties = await session.try_get_media_properties_async()
@@ -477,8 +487,10 @@ async def update_media(mediaController, session, websocket):  #main media grabbe
                         await sendThumbnail(websocket,"AlbumCoverForESP.png", "albumCoverRGB.rgb565")
 
                 currentVol = await getVolume()
-                global cached_volume
-                cached_volume = currentVol
+                # Do not let a stale polling read undo a joystick command
+                # while the Windows endpoint is still settling.
+                if time.monotonic() - last_volume_command_at >= VOLUME_COMMAND_HOLD_SECONDS:
+                    cached_volume = currentVol
                 position = timeLineProperties.position  # get current spot in the song
                 offset = getPositionOffset(
                     timeLineProperties)  # compensate for delayed windows update -> compare last update to current time
