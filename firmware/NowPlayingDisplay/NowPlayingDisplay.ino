@@ -64,10 +64,10 @@
  *   GND    → ESP32 GND
  *
  * Volume and direction controls:
- *   - Hold up for 220 ms, then repeat volume + JOY_STEP_PCT.
- *   - Hold down for 220 ms, then repeat volume - JOY_STEP_PCT.
+ *   - Hold up for 220 ms, then repeat a VolumeUp command.
+ *   - Hold down for 220 ms, then repeat a VolumeDown command.
  *   - Move RIGHT once for Next; move LEFT once for Previous.
- *   - The 1500/2500 ADC bands require deliberate axis displacement.
+ *   - A calibrated-center offset requires deliberate axis displacement.
  *   - Horizontal/vertical priority prevents diagonal accidental swipes.
  *   - Actions fire once, then reset after returning to neutral.
  *
@@ -86,8 +86,6 @@
 #define JOY_X_PIN 35          // joystick horizontal axis → GPIO35 (ADC1)
 #define JOY_Y_PIN 32          // joystick vertical axis → GPIO32 (ADC1)
 #define JOY_SW_PIN 27         // joystick click → GPIO27, input with INPUT_PULLUP
-#define JOY_STEP_PCT 2        // volume change per accepted joystick repeat
-#define VOLUME_SEND_MS 100    // legacy throttle kept for compatibility
 #define JOY_ACTION_OFFSET 900 // clear displacement from calibrated center
 #define JOY_RETURN_OFFSET 450 // hysteresis band for returning to neutral
 #define JOY_REPEAT_MS 160     // volume repeat delay while held away from center
@@ -287,11 +285,6 @@ void setup() {
 // Axis values use a high neutral deadband and edge-triggered actions.
 // Click sends PlayPause; long click sends Shuffle.
 // ============================================================
-static int joystickVolume = 50;
-static int lastVolumeSent = 50;
-static unsigned long lastVolumeSend = 0;
-static unsigned long lastJoystickMove = 0;
-static unsigned long joystickVolumeLockUntil = 0;
 
 static int joyNeutralX = 2048;
 static int joyNeutralY = 2048;
@@ -311,10 +304,9 @@ static bool clickActionFired = false;
 static lv_obj_t *volumeLabel = nullptr; // stretch goal: tiny on-screen volume readout
 static unsigned long volumeLabelHideAt = 0;
 
-static void sendVolume(int pct) { // {"action":"Volume","value":N} on the action channel
+static void sendVolumeStep(bool increase) {
   JsonDocument doc;
-  doc["action"] = "Volume";
-  doc["value"] = pct;
+  doc["action"] = increase ? "VolumeUp" : "VolumeDown";
 
   char msg[32];
   serializeJson(doc, msg, sizeof(msg));
@@ -412,17 +404,8 @@ static void serviceJoystick() {
       nextVolumeRepeatAt = now;
     }
     if (axisActionFired && now >= nextVolumeRepeatAt) {
-      int nextVolume = constrain(joystickVolume + (activeAxis == 'U' ? JOY_STEP_PCT : -JOY_STEP_PCT), 0, 100);
-      if (nextVolume != joystickVolume) {
-        joystickVolume = nextVolume;
-        joystickVolumeLockUntil = now + 1200;
-        lastVolumeSent = joystickVolume;
-        lastJoystickMove = now;
-        showVolumeLabel(joystickVolume);
-        sendVolume(joystickVolume);
-        lastVolumeSend = now;
-        nextVolumeRepeatAt = now + JOY_REPEAT_MS;
-      }
+      sendVolumeStep(activeAxis == 'U');
+      nextVolumeRepeatAt = now + JOY_REPEAT_MS;
     }
   }
 
@@ -588,11 +571,6 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
 
         if (doc["type"] == "media_update"){
           volume = doc["volume"] | 0;
-          unsigned long now = millis();
-          if (activeAxis == 0 && now >= joystickVolumeLockUntil) {
-            joystickVolume = constrain((int)volume, 0, 100);
-            lastVolumeSent = joystickVolume;
-          }
           playing = doc["playing"] | false;
           copyTrackField(title, sizeof(title), doc["title"] | "Unknown");
           copyTrackField(artist, sizeof(artist), doc["artist"] | "No Artist Available");

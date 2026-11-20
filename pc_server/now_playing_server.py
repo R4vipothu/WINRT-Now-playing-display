@@ -35,6 +35,10 @@ backgroundColor = 0xFFFFFF
 
 setup_received = asyncio.Event()
 
+# Cached master volume used by the joystick's relative VolumeUp/VolumeDown
+# commands. The media-update loop refreshes this from Windows periodically.
+cached_volume = 50
+
 DISPLAYTYPE = -1 # 1 is standard, 2 is album disk
 
 CHARACTER_REPLACEMENTS = {
@@ -128,6 +132,14 @@ async def setVolume(level):  # use me
 async def getVolume():
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(audio_pool, _get_volume)
+
+
+async def changeVolume(delta):
+    """Apply a small relative volume change without an ESP32 feedback loop."""
+    global cached_volume
+    cached_volume = max(0, min(100, cached_volume + delta))
+    await setVolume(cached_volume / 100.0)
+    print("Volume ->", cached_volume)
 
 # Playback control: WinRT SMTC sessions are read-only (you can watch them,
 # not command them), so playback gestures are sent as virtual media keys via
@@ -366,6 +378,10 @@ async def handle_client(websocket): #set up websocket
                                 level = max(0.0, min(1.0, float(data.get("value", 0)) / 100.0))
                                 await setVolume(level)
                                 print("Volume ->", round(level * 100))
+                            elif data["action"] == "VolumeUp":
+                                await changeVolume(2)
+                            elif data["action"] == "VolumeDown":
+                                await changeVolume(-2)
                             elif data["action"] == "PlayPause":
                                 await playPause(mediaController)
                                 print("PlayPause")
@@ -461,6 +477,8 @@ async def update_media(mediaController, session, websocket):  #main media grabbe
                         await sendThumbnail(websocket,"AlbumCoverForESP.png", "albumCoverRGB.rgb565")
 
                 currentVol = await getVolume()
+                global cached_volume
+                cached_volume = currentVol
                 position = timeLineProperties.position  # get current spot in the song
                 offset = getPositionOffset(
                     timeLineProperties)  # compensate for delayed windows update -> compare last update to current time
