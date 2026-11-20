@@ -135,6 +135,8 @@ lv_obj_t *placeHolderCover = nullptr;
 lv_obj_t *progressRing = nullptr;
 lv_obj_t *nameOfSong;
 lv_obj_t *nameOfArtist;
+lv_obj_t *playbackStatusIcon = nullptr;
+lv_obj_t *shuffleStatusIcon = nullptr;
 lv_obj_t *spindleHub;
 lv_obj_t *vinylDisc = nullptr; // circular clipping container that holds the art
 lv_obj_t *textStrip = nullptr; // semi-transparent strip behind the track info
@@ -257,11 +259,27 @@ void setup() {
   lv_obj_remove_flag(stripCore, LV_OBJ_FLAG_SCROLLABLE);
 
   nameOfSong = lv_label_create(lv_screen_active());
-  lv_obj_set_width(nameOfSong, TFT_HOR_RES - 16); // long titles scroll instead of overflowing
+  lv_obj_set_width(nameOfSong, TFT_HOR_RES - 42); // leave room for status icons
   lv_label_set_long_mode(nameOfSong, LV_LABEL_LONG_SCROLL_CIRCULAR);
   nameOfArtist = lv_label_create(lv_screen_active());
-  lv_obj_set_width(nameOfArtist, TFT_HOR_RES - 16);
+  lv_obj_set_width(nameOfArtist, TFT_HOR_RES - 42);
   lv_label_set_long_mode(nameOfArtist, LV_LABEL_LONG_SCROLL_CIRCULAR);
+
+  // Compact status icons at the right side of the track strip. ASCII symbols
+  // are used instead of font-dependent Unicode glyphs so they render on the
+  // configured LVGL font set.
+  playbackStatusIcon = lv_label_create(lv_screen_active());
+  lv_obj_set_width(playbackStatusIcon, 18);
+  lv_obj_set_style_text_color(playbackStatusIcon, lv_color_make(255, 255, 255), 0);
+  lv_obj_set_style_text_font(playbackStatusIcon, &lv_font_montserrat_14, 0);
+  lv_obj_set_pos(playbackStatusIcon, 216, 188);
+
+  shuffleStatusIcon = lv_label_create(lv_screen_active());
+  lv_obj_set_width(shuffleStatusIcon, 18);
+  lv_obj_set_style_text_color(shuffleStatusIcon, lv_color_make(255, 190, 70), 0);
+  lv_obj_set_style_text_font(shuffleStatusIcon, &lv_font_montserrat_10, 0);
+  lv_obj_set_pos(shuffleStatusIcon, 216, 208);
+  lv_obj_add_flag(shuffleStatusIcon, LV_OBJ_FLAG_HIDDEN);
   
   playing = false; // assume there's no music
   volume = 0;
@@ -334,6 +352,22 @@ static void showVolumeLabel(int pct) {
   lv_obj_remove_flag(volumeLabel, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(volumeLabel);
   volumeLabelHideAt = millis() + 1000; // hide ~1 s after the last change
+}
+
+static void updateStatusIcons(bool isPlaying, bool isShuffling) {
+  if (playbackStatusIcon != nullptr) {
+    lv_label_set_text(playbackStatusIcon, isPlaying ? ">" : "||");
+    lv_obj_move_foreground(playbackStatusIcon);
+  }
+  if (shuffleStatusIcon != nullptr) {
+    lv_label_set_text(shuffleStatusIcon, "S");
+    if (isShuffling) {
+      lv_obj_remove_flag(shuffleStatusIcon, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_move_foreground(shuffleStatusIcon);
+    } else {
+      lv_obj_add_flag(shuffleStatusIcon, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
 }
 
 static void serviceJoystick() {
@@ -578,6 +612,8 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
             showVolumeLabel(reportedVolume);
           }
           playing = doc["playing"] | false;
+          bool shuffling = doc["shuffling"] | false;
+          updateStatusIcons(playing, shuffling);
           copyTrackField(title, sizeof(title), doc["title"] | "Unknown");
           copyTrackField(artist, sizeof(artist), doc["artist"] | "No Artist Available");
           currentPosition = doc["currentPos"] | 1;
