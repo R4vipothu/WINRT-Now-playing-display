@@ -106,11 +106,13 @@ CHARACTER_REPLACEMENTS = {
 # pycaw functions set up for async
 def _set_volume(level):  # level 0.0 to 1.0
     from pycaw.pycaw import AudioUtilities
-    # Read and write the same endpoint. Previously writes went to each
-    # session while reads came from the endpoint, so the cache immediately
-    # jumped back to an unrelated/stale value.
+    # Update both the Windows master endpoint and the active session mixer
+    # entries. Windows can display either one depending on the mixer view.
     devices = AudioUtilities.GetSpeakers()
     devices.EndpointVolume.SetMasterVolumeLevelScalar(level, None)
+    for session in AudioUtilities.GetAllSessions():
+        if session.SimpleAudioVolume is not None:
+            session.SimpleAudioVolume.SetMasterVolume(level, None)
 
 def _set_mute(mute):  # sets all muted (true or false
     from pycaw.pycaw import AudioUtilities
@@ -388,9 +390,9 @@ async def handle_client(websocket): #set up websocket
                                 last_volume_command_at = time.monotonic()
                                 print("Volume ->", round(level * 100))
                             elif data["action"] == "VolumeUp":
-                                await changeVolume(2)
+                                await changeVolume(10)
                             elif data["action"] == "VolumeDown":
-                                await changeVolume(-2)
+                                await changeVolume(-10)
                             elif data["action"] == "PlayPause":
                                 await playPause(mediaController)
                                 print("PlayPause")

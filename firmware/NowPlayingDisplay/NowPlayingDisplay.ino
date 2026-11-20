@@ -303,6 +303,7 @@ static bool clickActionFired = false;
 
 static lv_obj_t *volumeLabel = nullptr; // stretch goal: tiny on-screen volume readout
 static unsigned long volumeLabelHideAt = 0;
+static int lastDisplayedVolume = -1;
 
 static void sendVolumeStep(bool increase) {
   JsonDocument doc;
@@ -571,6 +572,11 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
 
         if (doc["type"] == "media_update"){
           volume = doc["volume"] | 0;
+          int reportedVolume = constrain((int)volume, 0, 100);
+          if (reportedVolume != lastDisplayedVolume) {
+            lastDisplayedVolume = reportedVolume;
+            showVolumeLabel(reportedVolume);
+          }
           playing = doc["playing"] | false;
           copyTrackField(title, sizeof(title), doc["title"] | "Unknown");
           copyTrackField(artist, sizeof(artist), doc["artist"] | "No Artist Available");
