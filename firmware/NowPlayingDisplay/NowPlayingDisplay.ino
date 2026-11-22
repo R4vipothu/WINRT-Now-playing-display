@@ -429,7 +429,7 @@ static void serviceJoystick() {
   int xOffset = x - joyNeutralX;
   int yOffset = y - joyNeutralY;
 
-  if (DEBUG_LOG/* || now - lastJoyDebugAt >= 500*/) {
+  if (DEBUG_LOG || now - lastJoyDebugAt >= 500) {
     Serial.printf("JOY X=%d Y=%d offsets X=%d Y=%d\n", x, y, xOffset, yOffset);
     lastJoyDebugAt = now;
   }
