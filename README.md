@@ -85,6 +85,19 @@ now-playing-display/
 
 Joystick X/Y axes use calibrated 12-bit ADC center and return hysteresis to prevent accidental diagonal or repeated actions. The LVGL play/pause and shuffle symbols are shown in the lower status area; an inactive shuffle state hides the shuffle symbol.
 
+## On-screen feedback
+
+Every joystick action flashes a huge LVGL symbol on a dark badge centered over the spinning album art for 1.2 seconds:
+
+| Action | Symbol |
+|---|---|
+| Next | `LV_SYMBOL_NEXT` |
+| Previous | `LV_SYMBOL_PREV` |
+| Play/pause | `LV_SYMBOL_PLAY` / `LV_SYMBOL_PAUSE` |
+| Shuffle | `LV_SYMBOL_SHUFFLE` |
+
+When the Windows volume changes, the same badge shows the speaker level: `LV_SYMBOL_MUTE` at 0%, `LV_SYMBOL_VOLUME_MID` below 50%, and `LV_SYMBOL_VOLUME_MAX` at 50% or above. This badge is separate from the two small status icons next to the track title.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

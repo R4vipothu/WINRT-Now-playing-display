@@ -50,6 +50,8 @@
 #define ROTATION_STEP_DEG 20    // spin step per tick (of 3600 = one turn)
 #define STRIP_HEIGHT 58         // bottom text strip
 #define STRIP_CORE_HEIGHT 34    // denser lower band of the strip
+#define FEEDBACK_DISC_SIZE 136  // dark badge behind the big transient icon
+#define FEEDBACK_FLASH_MS 1200  // how long the big icon stays on the album art
 
 /*
  * ----------------------------------------------------------------
@@ -137,6 +139,8 @@ lv_obj_t *nameOfSong;
 lv_obj_t *nameOfArtist;
 lv_obj_t *playbackStatusIcon = nullptr;
 lv_obj_t *shuffleStatusIcon = nullptr;
+lv_obj_t *flashDisc = nullptr;   // dark badge behind the transient big icon
+lv_obj_t *flashedIcon = nullptr; // huge symbol flashed over the album art
 lv_obj_t *spindleHub;
 lv_obj_t *vinylDisc = nullptr; // circular clipping container that holds the art
 lv_obj_t *textStrip = nullptr; // semi-transparent strip behind the track info
@@ -265,14 +269,29 @@ void setup() {
   lv_obj_set_width(nameOfArtist, TFT_HOR_RES - 42);
   lv_label_set_long_mode(nameOfArtist, LV_LABEL_LONG_SCROLL_CIRCULAR);
 
-  // Compact status icons at the right side of the track strip. ASCII symbols
-  // are used instead of font-dependent Unicode glyphs so they render on the
-  // configured LVGL font set.
+  // Compact status icons at the right side of the track strip. They stay put
+  // and only mirror the live play/pause and shuffle state.
   playbackStatusIcon = lv_label_create(lv_screen_active());
   lv_obj_set_width(playbackStatusIcon, 18);
   lv_obj_set_style_text_color(playbackStatusIcon, lv_color_make(255, 120, 80), 0);
   lv_obj_set_style_text_font(playbackStatusIcon, &lv_font_montserrat_14, 0);
   lv_obj_set_pos(playbackStatusIcon, 216, 188);
+
+  // Transient feedback badge, fully independent of the two small status icons.
+  // A dark disc sits over the album art and hosts one huge LVGL symbol that
+  // flashes for FEEDBACK_FLASH_MS before hiding again.
+  flashDisc = makeDisc(lv_screen_active(), FEEDBACK_DISC_SIZE, BLACK);
+  lv_obj_set_style_bg_opa(flashDisc, LV_OPA_60, 0);
+  lv_obj_align(flashDisc, LV_ALIGN_CENTER, 0, -VINYL_Y_OFFSET);
+  lv_obj_add_flag(flashDisc, LV_OBJ_FLAG_HIDDEN);
+
+  flashedIcon = lv_label_create(lv_screen_active());
+  lv_obj_set_width(flashedIcon, VINYL_SIZE); // fixed width keeps the glyph centered
+  lv_obj_set_style_text_align(flashedIcon, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_color(flashedIcon, lv_color_make(255, 255, 255), 0);
+  lv_obj_set_style_text_font(flashedIcon, &lv_font_montserrat_48, 0);
+  lv_obj_align(flashedIcon, LV_ALIGN_CENTER, 0, -VINYL_Y_OFFSET);
+  lv_obj_add_flag(flashedIcon, LV_OBJ_FLAG_HIDDEN);
 
   shuffleStatusIcon = lv_label_create(lv_screen_active());
   lv_obj_set_width(shuffleStatusIcon, 18);
@@ -319,11 +338,9 @@ static unsigned long btnChangeAt = 0;
 static unsigned long pressStartAt = 0;
 static bool clickActionFired = false;
 
-static lv_obj_t *volumeLabel = nullptr; // stretch goal: tiny on-screen volume readout
-static unsigned long volumeLabelHideAt = 0;
-static int lastDisplayedVolume = -1;
-static unsigned long playbackIconFlashUntil = 0;
-static bool playbackFlashActive = false;
+static int lastDisplayedVolume = -1; // -1 until the first reading is adopted silently
+static unsigned long feedbackHideAt = 0;
+static bool feedbackActive = false;
 
 static void sendVolumeStep(bool increase) {
   JsonDocument doc;
@@ -335,33 +352,31 @@ static void sendVolumeStep(bool increase) {
   Serial.printf("JOYSTICK SEND %s\n", msg);
 }
 
-static void showVolumeLabel(int pct) {
-  if (volumeLabel == nullptr) { // created lazily, hidden by default, so the
-    volumeLabel = lv_label_create(lv_screen_active()); // existing layout is untouched
-    lv_obj_set_style_text_font(volumeLabel, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(volumeLabel, lv_color_make(255, 255, 255), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(volumeLabel, lv_color_black(), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(volumeLabel, LV_OPA_70, LV_PART_MAIN);
-    lv_obj_set_style_radius(volumeLabel, 10, LV_PART_MAIN);
-    lv_obj_set_style_pad_hor(volumeLabel, 8, LV_PART_MAIN);
-    lv_obj_set_style_pad_ver(volumeLabel, 4, LV_PART_MAIN);
-    lv_obj_align(volumeLabel, LV_ALIGN_CENTER, 0, -60);
-    lv_obj_add_flag(volumeLabel, LV_OBJ_FLAG_HIDDEN);
-  }
-  char buf[12];
-  snprintf(buf, sizeof(buf), "Vol %d%%", pct);
-  lv_label_set_text(volumeLabel, buf);
-  lv_obj_remove_flag(volumeLabel, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_move_foreground(volumeLabel);
-  volumeLabelHideAt = millis() + 1000; // hide ~1 s after the last change
+// Map a 0-100 volume level onto the LVGL speaker symbols.
+static const char *volumeSymbol(int pct) {
+  if (pct <= 0) return LV_SYMBOL_MUTE;
+  if (pct < 50) return LV_SYMBOL_VOLUME_MID;
+  return LV_SYMBOL_VOLUME_MAX;
 }
 
-static void flashPlaybackIcon(const char *symbol, unsigned long now) {
-  if (playbackStatusIcon == nullptr) return;
-  lv_label_set_text(playbackStatusIcon, symbol);
-  lv_obj_move_foreground(playbackStatusIcon);
-  playbackIconFlashUntil = now + 800;
-  playbackFlashActive = true;
+// Show one huge symbol on the badge over the album art for a moment.
+static void showFeedback(const char *symbol, unsigned long now) {
+  if (flashedIcon == nullptr) return;
+
+  lv_label_set_text(flashedIcon, symbol);
+  // Re-center after the text (and therefore the label height) changes.
+  lv_obj_align(flashedIcon, LV_ALIGN_CENTER, 0, -VINYL_Y_OFFSET);
+  lv_obj_remove_flag(flashedIcon, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(flashedIcon);
+
+  if (flashDisc != nullptr) {
+    lv_obj_remove_flag(flashDisc, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(flashDisc);
+    lv_obj_move_foreground(flashedIcon); // keep the glyph above its badge
+  }
+
+  feedbackHideAt = now + FEEDBACK_FLASH_MS;
+  feedbackActive = true;
 }
 
 static void updateStatusIcons(bool isPlaying, bool isShuffling) {
@@ -383,11 +398,11 @@ static void updateStatusIcons(bool isPlaying, bool isShuffling) {
 static void serviceJoystick() {
   unsigned long now = millis();
 
-  if (playbackFlashActive && (long)(now - playbackIconFlashUntil) >= 0) {
-    playbackFlashActive = false;
-    if (playbackStatusIcon != nullptr) {
-      lv_label_set_text(playbackStatusIcon, playing ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
-    }
+  // Hide the big feedback badge once its moment on screen has passed.
+  if (feedbackActive && (long)(now - feedbackHideAt) >= 0) {
+    feedbackActive = false;
+    if (flashedIcon != nullptr) lv_obj_add_flag(flashedIcon, LV_OBJ_FLAG_HIDDEN);
+    if (flashDisc != nullptr) lv_obj_add_flag(flashDisc, LV_OBJ_FLAG_HIDDEN);
   }
 
   int x = analogRead(JOY_X_PIN);
@@ -414,7 +429,7 @@ static void serviceJoystick() {
   int xOffset = x - joyNeutralX;
   int yOffset = y - joyNeutralY;
 
-  if (DEBUG_LOG/* || now - lastJoyDebugAt >= 500*/) {
+  if (DEBUG_LOG || now - lastJoyDebugAt >= 500) {
     Serial.printf("JOY X=%d Y=%d offsets X=%d Y=%d\n", x, y, xOffset, yOffset);
     lastJoyDebugAt = now;
   }
@@ -479,13 +494,6 @@ static void serviceJoystick() {
   if (btnPressed && !clickActionFired && now - pressStartAt >= JOY_CLICK_LONG_MS) {
     clickActionFired = true;
     sendAction("Shuffle");
-  }
-
-  // ---- volume label auto-hide ----
-  if (volumeLabel != nullptr &&
-      !lv_obj_has_flag(volumeLabel, LV_OBJ_FLAG_HIDDEN) &&
-      (long)(now - volumeLabelHideAt) >= 0) {
-    lv_obj_add_flag(volumeLabel, LV_OBJ_FLAG_HIDDEN);
   }
 }
 
@@ -623,10 +631,13 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
 
         if (doc["type"] == "media_update"){
           volume = doc["volume"] | 0;
+          bool hasTrack = strcmp(doc["title"] | "Unknown", "Unknown") != 0;
           int reportedVolume = constrain((int)volume, 0, 100);
-          if (reportedVolume != lastDisplayedVolume) {
+          if (!hasTrack || lastDisplayedVolume < 0) {
+            lastDisplayedVolume = reportedVolume; // adopt silently while idle
+          } else if (reportedVolume != lastDisplayedVolume) {
             lastDisplayedVolume = reportedVolume;
-            showVolumeLabel(reportedVolume);
+            showFeedback(volumeSymbol(reportedVolume), millis());
           }
           playing = doc["playing"] | false;
           bool shuffling = doc["shuffling"] | false;
@@ -716,12 +727,15 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) { // handles
 
 void sendAction(const char* action) { // use this to send messages to the Python server
   unsigned long now = millis();
+  // Flash the matching huge symbol over the album art as immediate feedback.
   if (strcmp(action, "Next") == 0) {
-    flashPlaybackIcon(LV_SYMBOL_NEXT, now);
+    showFeedback(LV_SYMBOL_NEXT, now);
   } else if (strcmp(action, "Previous") == 0) {
-    flashPlaybackIcon(LV_SYMBOL_PREV, now);
+    showFeedback(LV_SYMBOL_PREV, now);
   } else if (strcmp(action, "PlayPause") == 0) {
-    flashPlaybackIcon(playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY, now);
+    showFeedback(playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY, now);
+  } else if (strcmp(action, "Shuffle") == 0) {
+    showFeedback(LV_SYMBOL_SHUFFLE, now);
   }
 
   JsonDocument doc;
